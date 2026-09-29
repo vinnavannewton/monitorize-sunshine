@@ -1554,7 +1554,9 @@ namespace platf {
         // VKMS scanout DMA-BUFs are CPU-mappable but cannot be imported as
         // textures by the real GPU on some multi-GPU Wayland desktops.
         version_t driver {drmGetVersion(card.fd.el)};
-        cpu_map_vkms = driver && driver->name && std::string_view(driver->name) == "vkms";
+        cpu_map_vkms = driver && driver->name &&
+                       (std::string_view(driver->name) == "vkms" ||
+                        std::string_view(driver->name) == "monitorize_vkms");
         if (cpu_map_vkms) {
           BOOST_LOG(info) << "Using CPU-mapped KMS frames for VKMS"sv;
           return 0;
@@ -2004,6 +2006,16 @@ namespace platf {
        */
       int init(const std::string &display_name, const ::video::config_t &config) {
         if (display_t::init(display_name, config)) {
+          return -1;
+        }
+
+        // Virtual KMS scanout buffers cannot reliably be imported as textures
+        // on the encoding GPU. Copy through RAM while retaining the encoder.
+        version_t driver {drmGetVersion(card.fd.el)};
+        if (driver && driver->name &&
+            (std::string_view(driver->name) == "vkms" ||
+             std::string_view(driver->name) == "monitorize_vkms")) {
+          BOOST_LOG(info) << "Using RAM transfer for VKMS KMS capture"sv;
           return -1;
         }
 
