@@ -17,6 +17,7 @@
 // local includes
 #include "cuda.h"
 #include "graphics.h"
+#include "pipewire_target.h"
 #include "src/main.h"
 #include "src/platform/common.h"
 #include "src/video.h"
@@ -298,18 +299,28 @@ namespace pipewire {
         }
 
         struct pw_properties *props = pw_properties_new(PW_KEY_MEDIA_TYPE, "Video", PW_KEY_MEDIA_CATEGORY, "Capture", PW_KEY_MEDIA_ROLE, "Screen", nullptr);
-        if (object_serial != 0 && (object_serial & SPA_ID_INVALID) != SPA_ID_INVALID) {
-          pw_properties_setf(props, PW_KEY_TARGET_OBJECT, "%" PRIu64, object_serial);
-          pw_properties_setf(props, "node.target", "%" PRIu64, object_serial);
-          BOOST_LOG(info) << "[pipewire] Targeting PipeWire object serial: "sv << object_serial;
-        } else if (node != PW_ID_ANY && node != 0) {
-          pw_properties_setf(props, PW_KEY_TARGET_OBJECT, "%u", node);
-          pw_properties_setf(props, "node.target", "%u", node);
-          BOOST_LOG(info) << "[pipewire] Targeting PipeWire node id: "sv << node;
+        uint32_t target_id = PW_ID_ANY;
+        if (!configure_capture_target(props, node, object_serial, target_id)) {
+          BOOST_LOG(error) << "[pipewire] Cannot configure capture target: node ID "sv << node << " object serial "sv << object_serial;
+          if (props) {
+            pw_properties_free(props);
+          }
+          pw_thread_loop_unlock(loop);
+          return -1;
+        }
+        if (target_id == PW_ID_ANY) {
+          BOOST_LOG(info) << "[pipewire] Targeting object serial "sv << object_serial << " using target.object"sv;
+        } else {
+          BOOST_LOG(info) << "[pipewire] Targeting node ID "sv << node << " using pw_stream_connect; serial unavailable"sv;
         }
 
         BOOST_LOG(debug) << "[pipewire] Create PW stream"sv;
         stream_data.stream = pw_stream_new(core, "Sunshine Video Capture", props);
+        if (!stream_data.stream) {
+          BOOST_LOG(error) << "[pipewire] Failed to create capture stream"sv;
+          pw_thread_loop_unlock(loop);
+          return -1;
+        }
         pw_stream_add_listener(stream_data.stream, &stream_data.stream_listener, &stream_events, &stream_data);
 
         std::array<uint8_t, SPA_POD_BUFFER_SIZE> buffer;
@@ -344,7 +355,6 @@ namespace pipewire {
         }
 
         BOOST_LOG(debug) << "[pipewire] Connect PW stream - fd: "sv << fd << " node: "sv << node << " object serial: "sv << object_serial;
-        uint32_t target_id = (object_serial != 0 && (object_serial & SPA_ID_INVALID) != SPA_ID_INVALID) ? PW_ID_ANY : node;
         result = pw_stream_connect(stream_data.stream, PW_DIRECTION_INPUT, target_id, (enum pw_stream_flags)(PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS), params.data(), n_params);
       }
 
