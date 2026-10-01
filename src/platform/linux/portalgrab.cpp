@@ -5,6 +5,8 @@
 // local includes
 #include "pipewire.cpp"
 
+#include <filesystem>
+
 namespace {
   // Portal configuration constants
   constexpr uint32_t SOURCE_TYPE_MONITOR = 1;
@@ -87,6 +89,7 @@ namespace portal {
      * @brief Load persisted state from its backing store.
      */
     static void load() {
+      token_->clear();
       std::ifstream file(get_file_path());
       if (file.is_open()) {
         std::getline(file, *token_);
@@ -109,6 +112,20 @@ namespace portal {
         BOOST_LOG(info) << "[portalgrab] Saved portal restore token to disk"sv;
       } else {
         BOOST_LOG(warning) << "[portalgrab] Failed to save portal restore token"sv;
+      }
+    }
+
+    /**
+     * @brief Forget an unusable restored permission for this capture target.
+     */
+    static void clear() {
+      token_->clear();
+      std::error_code error;
+      const bool removed = std::filesystem::remove(get_file_path(), error);
+      if (error) {
+        BOOST_LOG(warning) << "[portalgrab] Failed to clear portal restore token: "sv << error.message();
+      } else if (removed) {
+        BOOST_LOG(info) << "[portalgrab] Cleared portal restore token after a failed restore"sv;
       }
     }
 
@@ -178,6 +195,12 @@ namespace portal {
     }
   };
 
+  enum class portal_start_result_e {
+    success,
+    failed,
+    missing_streams,
+  };
+
   /**
    * @brief DBus connection and portal request helpers for screencast setup.
    */
@@ -187,29 +210,7 @@ namespace portal {
 
     ~dbus_t() noexcept {
       try {
-        if (conn && !session_handle.empty()) {
-          g_autoptr(GError) err = nullptr;
-          // This is a blocking C call; it won't throw, but we wrap for safety
-          g_dbus_connection_call_sync(
-            conn,
-            "org.freedesktop.portal.Desktop",
-            session_handle.c_str(),
-            "org.freedesktop.portal.Session",
-            "Close",
-            nullptr,
-            nullptr,
-            G_DBUS_CALL_FLAGS_NONE,
-            -1,
-            nullptr,
-            &err
-          );
-
-          if (err) {
-            BOOST_LOG(warning) << "[portalgrab] Failed to explicitly close portal session: "sv << err->message;
-          } else {
-            BOOST_LOG(debug) << "[portalgrab] Explicitly closed portal session: "sv << session_handle;
-          }
-        }
+        close_portal_session();
       } catch (const std::exception &e) {
         BOOST_LOG(error) << "[portalgrab] Standard exception caught in ~dbus_t: "sv << e.what();
       } catch (...) {
@@ -228,6 +229,41 @@ namespace portal {
       if (conn) {
         g_clear_object(&conn);
       }
+    }
+
+    /**
+     * @brief Close the current portal session before retrying or tearing down.
+     */
+    void close_portal_session() noexcept {
+      if (!conn || session_handle.empty()) {
+        return;
+      }
+      try {
+        g_autoptr(GError) err = nullptr;
+        g_dbus_connection_call_sync(
+          conn,
+          "org.freedesktop.portal.Desktop",
+          session_handle.c_str(),
+          "org.freedesktop.portal.Session",
+          "Close",
+          nullptr,
+          nullptr,
+          G_DBUS_CALL_FLAGS_NONE,
+          -1,
+          nullptr,
+          &err
+        );
+        if (err) {
+          BOOST_LOG(warning) << "[portalgrab] Failed to explicitly close portal session: "sv << err->message;
+        } else {
+          BOOST_LOG(debug) << "[portalgrab] Explicitly closed portal session: "sv << session_handle;
+        }
+      } catch (const std::exception &e) {
+        BOOST_LOG(error) << "[portalgrab] Standard exception while closing portal session: "sv << e.what();
+      } catch (...) {
+        BOOST_LOG(error) << "[portalgrab] Unknown exception while closing portal session"sv;
+      }
+      session_handle.clear();
     }
 
     /**
@@ -261,36 +297,65 @@ namespace portal {
      */
     int connect_to_portal() {
       g_autoptr(GMainLoop) loop = g_main_loop_new(nullptr, FALSE);
-      g_autofree gchar *session_path = nullptr;
-      g_autofree gchar *session_token = nullptr;
-      create_session_path(conn, nullptr, &session_token);
+      bool retried_without_token = false;
+      while (true) {
+        const bool used_restore_token = !restore_token_t::empty();
+        g_autofree gchar *session_path = nullptr;
+        g_autofree gchar *session_token = nullptr;
+        create_session_path(conn, nullptr, &session_token);
+        pipewire_streams.clear();
 
-      // Try combined RemoteDesktop + ScreenCast session first
-      bool use_screencast_only = !try_remote_desktop_session(loop, &session_path, session_token);
+        // Try combined RemoteDesktop + ScreenCast session first.
+        bool use_screencast_only = !try_remote_desktop_session(loop, &session_path, session_token);
 
-      // Fall back to ScreenCast-only if RemoteDesktop failed
-      if (use_screencast_only && try_screencast_only_session(loop, &session_path) < 0) {
-        return -1;
-      }
+        // Fall back to ScreenCast-only if RemoteDesktop failed.
+        if (use_screencast_only) {
+          close_portal_session();
+          g_clear_pointer(&session_path, g_free);
+          if (try_screencast_only_session(loop, &session_path) < 0) {
+            return -1;
+          }
+        }
 
-      if (start_portal_session(loop, session_path, pipewire_streams, use_screencast_only) < 0) {
-        return -1;
-      }
+        const auto start_result = start_portal_session(
+          loop, session_path, pipewire_streams, use_screencast_only
+        );
+        bool retry_without_token = (
+          used_restore_token && !retried_without_token &&
+          start_result == portal_start_result_e::missing_streams
+        );
 
-      // Reject a restored/selected monitor other than the one requested by
-      // Monitorize. Never use the first portal stream as a substitute.
-      if (const char *target = std::getenv("MONITORIZE_CAPTURE_OUTPUT"); target && *target) {
-        std::erase_if(pipewire_streams, [target](const auto &stream) { return stream.monitor_name != target; });
-        if (pipewire_streams.size() != 1) {
-          BOOST_LOG(error) << "[portalgrab] Selected portal monitor does not match " << target << ". Choose that monitor in the sharing dialog.";
+        // Reject a restored/selected monitor other than the one requested by
+        // Monitorize. Never use the first portal stream as a substitute.
+        if (start_result == portal_start_result_e::success) {
+          if (const char *target = std::getenv("MONITORIZE_CAPTURE_OUTPUT"); target && *target) {
+            std::erase_if(pipewire_streams, [target](const auto &stream) { return stream.monitor_name != target; });
+            if (pipewire_streams.size() != 1) {
+              BOOST_LOG(error) << "[portalgrab] Selected portal monitor does not match " << target << ". Choose that monitor in the sharing dialog.";
+              retry_without_token = used_restore_token && !retried_without_token;
+              if (!retry_without_token) {
+                return -1;
+              }
+            }
+          }
+        }
+
+        if (retry_without_token) {
+          BOOST_LOG(warning) << "[portalgrab] Restored portal session supplied no usable stream; retrying once with fresh permission"sv;
+          close_portal_session();
+          pipewire_streams.clear();
+          restore_token_t::clear();
+          retried_without_token = true;
+          continue;
+        }
+        if (start_result != portal_start_result_e::success) {
           return -1;
         }
+        if (open_pipewire_remote(session_path, pipewire_fd) < 0) {
+          return -1;
+        }
+        return 0;
       }
-      if (open_pipewire_remote(session_path, pipewire_fd) < 0) {
-        return -1;
-      }
-
-      return 0;
     }
 
     // Try to create a combined RemoteDesktop + ScreenCast session
@@ -556,7 +621,7 @@ namespace portal {
       return 0;
     }
 
-    int start_portal_session(GMainLoop *loop, const gchar *session_path, std::vector<pipewire_streaminfo_t> &out_pipewire_streams, bool use_screencast) {
+    portal_start_result_e start_portal_session(GMainLoop *loop, const gchar *session_path, std::vector<pipewire_streaminfo_t> &out_pipewire_streams, bool use_screencast) {
       GDBusProxy *proxy = use_screencast ? screencast_proxy : remote_desktop_proxy;
       const char *session_type = use_screencast ? "ScreenCast" : "RemoteDesktop";
 
@@ -578,7 +643,7 @@ namespace portal {
       g_autoptr(GVariant) reply = g_dbus_proxy_call_sync(proxy, "Start", g_variant_builder_end(&builder), G_DBUS_CALL_FLAGS_NONE, -1, nullptr, &err);
       if (err) {
         BOOST_LOG(error) << "[portalgrab] Could not start "sv << session_type << " session: "sv << err->message;
-        return -1;
+        return portal_start_result_e::failed;
       }
 
       const gchar *request_path = nullptr;
@@ -589,7 +654,7 @@ namespace portal {
 
       if (!start_response) {
         BOOST_LOG(error) << "[portalgrab] " << session_type << " Start: no response received"sv;
-        return -1;
+        return portal_start_result_e::failed;
       }
 
       guint32 response_code;
@@ -601,13 +666,13 @@ namespace portal {
 
       if (response_code != 0) {
         BOOST_LOG(error) << "[portalgrab] " << session_type << " Start failed with response code: "sv << response_code;
-        return -1;
+        return portal_start_result_e::failed;
       }
 
       streams = g_variant_lookup_value(dict, "streams", G_VARIANT_TYPE("a(ua{sv})"));
       if (!streams) {
         BOOST_LOG(error) << "[portalgrab] " << session_type << " Start: no streams in response"sv;
-        return -1;
+        return portal_start_result_e::missing_streams;
       }
 
       if (const gchar *new_token = nullptr; g_variant_lookup(dict, "restore_token", "s", &new_token) && new_token && new_token[0] != '\0' && restore_token_t::get() != new_token) {
@@ -670,7 +735,7 @@ namespace portal {
         return a.pos_x < b.pos_x || a.pos_y < b.pos_y;
       });
 
-      return 0;
+      return portal_start_result_e::success;
     }
 
     int open_pipewire_remote(const gchar *session_path, int &fd) {
