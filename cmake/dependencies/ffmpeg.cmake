@@ -64,7 +64,9 @@ if(NOT DEFINED FFMPEG_PREPARED_BINARIES)
     endif()
 
     # Set extraction directory and prepared binaries path
-    set(FFMPEG_EXTRACT_DIR "${FFMPEG_DOWNLOAD_DIR}")
+    # Isolate extracted libraries by release as well as the archive. Otherwise a
+    # dependency bump silently reuses the previous release's libavcodec.a.
+    set(FFMPEG_EXTRACT_DIR "${FFMPEG_VERSION_DIR}")
     set(FFMPEG_PREPARED_BINARIES "${FFMPEG_EXTRACT_DIR}/ffmpeg")
 
     # Set the archive filename based on architecture

@@ -16,6 +16,15 @@
 #include "nvenc/nvenc_config.h"
 
 namespace config {
+  namespace nv {
+    /**
+     * @brief Convert an NVENC quality preset to its version-stable FFmpeg name.
+     * @param quality_preset Validated quality preset in the range 1 through 7.
+     * @return FFmpeg preset name from p1 through p7.
+     */
+    std::string ffmpeg_preset_from_quality(int quality_preset);
+  }  // namespace nv
+
   // Valid range for the packetsize limit
   constexpr int PACKETSIZE_MIN = 200;  ///< Lowest accepted configured packet size in bytes.
   constexpr int PACKETSIZE_MAX = 65535;  ///< Highest accepted configured packet size in bytes.
@@ -68,11 +77,11 @@ namespace config {
     bool nv_sunshine_high_power_mode;  ///< Request NVIDIA high-power mode for Sunshine.
 
     struct {
-      int preset;
-      int multipass;
-      int h264_coder;
-      int aq;
-      int vbv_percentage_increase;
+      std::string preset;  ///< Version-stable FFmpeg NVENC preset name.
+      int multipass;  ///< NVENC multipass mode.
+      int h264_coder;  ///< H.264 entropy coding mode.
+      int spatial_aq;  ///< FFmpeg spatial adaptive quantization option.
+      int vbv_percentage_increase;  ///< Additional VBV buffer percentage.
     } nv_legacy;  ///< Legacy NVIDIA encoder options kept for config compatibility.
 
     struct {
