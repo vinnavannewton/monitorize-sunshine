@@ -1745,9 +1745,20 @@ namespace confighttp {
       _pin = std::stoi(pin);
       if (_pin < 0 || _pin > 9999) {
         bad_request(response, request, "PIN must be between 0000 and 9999");
+        return;
       }
 
-      output_tree["status"] = nvhttp::pin(pin, name);
+      std::string error_code;
+      const bool paired = nvhttp::pin(pin, name, &error_code);
+      output_tree["status"] = paired;
+      output_tree["pairing_complete"] = paired;
+      if (paired) {
+        BOOST_LOG(info) << "Moonlight pairing completed"sv;
+      } else {
+        BOOST_LOG(warning) << "Moonlight pairing did not complete ["sv << error_code << "]"sv;
+        output_tree["error_code"] = error_code;
+        output_tree["error"] = "Pairing did not complete. Keep one Moonlight pairing request open and try its current PIN again.";
+      }
       send_response(response, output_tree);
     } catch (std::exception &e) {
       BOOST_LOG(warning) << "SavePin: "sv << e.what();

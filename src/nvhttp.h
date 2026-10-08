@@ -15,6 +15,7 @@
 
 // local includes
 #include "crypto.h"
+#include "pairing_state.h"
 #include "thread_safe.h"
 
 /**
@@ -95,7 +96,7 @@ namespace nvhttp {
   /**
    * @brief Pairing handshake state exchanged with a Moonlight client.
    */
-  struct pair_session_t {
+  struct pair_session_t: pairing::state_t {
     struct {
       std::string uniqueID = {};
       std::string cert = {};
@@ -193,15 +194,16 @@ namespace nvhttp {
   void clientpairingsecret(pair_session_t &sess, std::shared_ptr<safe::queue_t<crypto::x509_t>> &add_cert, boost::property_tree::ptree &tree, const std::string &client_pairing_secret);
 
   /**
-   * @brief Compare the user supplied pin to the Moonlight pin.
+   * @brief Submit a PIN and wait for Moonlight to verify the handshake.
    * @param pin The user supplied pin.
    * @param name The user supplied name.
-   * @return `true` if the pin is correct, `false` otherwise.
+   * @param error_code Receives a non-sensitive failure category when provided.
+   * @return `true` only after final verification; `false` on failure or timeout.
    * @examples
    * bool pin_status = nvhttp::pin("1234", "laptop");
    * @examples_end
    */
-  bool pin(std::string pin, std::string name);
+  bool pin(std::string pin, std::string name, std::string *error_code = nullptr);
 
   /**
    * @brief Remove single client.
