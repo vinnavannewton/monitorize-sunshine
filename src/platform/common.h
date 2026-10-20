@@ -1276,6 +1276,14 @@ namespace platf {
    */
   [[nodiscard]] std::unique_ptr<deinit_t> init();
 
+#ifdef __linux__
+  /**
+   * @brief Refresh idle Linux capture sources after managed display creation.
+   * @return Whether the selected backend is available.
+   */
+  bool refresh_capture_sources();
+#endif
+
   /**
    * @brief Returns the current computer name in UTF-8.
    * @return Computer name or a placeholder upon failure.

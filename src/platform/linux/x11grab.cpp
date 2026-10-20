@@ -6,6 +6,7 @@
 #include <fstream>
 #include <ranges>
 #include <thread>
+#include "src/monitorize_control.h"
 
 // plaform includes
 #include <sys/ipc.h>
@@ -541,6 +542,11 @@ namespace platf {
         offset_x = crt_info->x;
         offset_y = crt_info->y;
       } else {
+        const char *exact = std::getenv("MONITORIZE_REQUIRE_EXACT_OUTPUT");
+        if (monitorize_control::enabled() || (exact && std::string_view(exact) == "1")) {
+          BOOST_LOG(error) << "Requested X11 output is unavailable; refusing desktop fallback: " << display_name;
+          return -1;
+        }
         BOOST_LOG(warning) << "Couldn't get info for requested display ["sv << display_name << "], defaulting to recording entire virtual desktop"sv;
         width = xattr.width;
         height = xattr.height;

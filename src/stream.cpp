@@ -26,6 +26,7 @@ extern "C" {
 #include "input.h"
 #include "logging.h"
 #include "network.h"
+#include "monitorize_control.h"
 #include "platform/common.h"
 #include "process.h"
 #include "stream.h"
@@ -535,6 +536,7 @@ namespace stream {
     } control;  ///< Runtime state for the encrypted GameStream control channel.
 
     std::uint32_t launch_session_id;  ///< RTSP launch-session ID associated with this stream.
+    bool monitorize_frame_ready = false; ///< Video sender reports usable capture only after an encoded frame exists.
     std::string client_cert;  ///< PEM certificate for the paired client owning the stream.
     std::string input_session_id;  ///< Stable client identity used to retain input devices across resume.
 
@@ -1499,6 +1501,18 @@ namespace stream {
       frame_network_latency_logger.first_point_now();
 
       auto session = (session_t *) packet->channel_data;
+      if (monitorize_control::lifecycle_enabled() && !session->monitorize_frame_ready) {
+        session->monitorize_frame_ready = true;
+        auto reply = monitorize_control::exchange(monitorize_control::configured_endpoint(), "stream_ready", monitorize_control::certificate_id(session->client_cert), std::to_string(session->launch_session_id), 0, 0, 0, 30000);
+        if (!reply.ok) {
+          BOOST_LOG(warning) << "Monitorize usable-frame notification failed: " << reply.error;
+          session::stop(*session);
+          continue;
+        }
+        if (reply.layout_changed) {
+          monitorize_control::layout_generation.fetch_add(1);
+        }
+      }
       auto lowseq = session->video.lowseq;
 
       std::string_view payload {(char *) packet->data(), packet->data_size()};
@@ -2195,13 +2209,19 @@ namespace stream {
           input::terminate_gamepads();
         }
 
-        if (revert_display_config) {
+        if (revert_display_config && !monitorize_control::enabled()) {
           display_device::revert_configuration();
         }
 
         platf::streaming_will_stop();
       }
 
+      if (monitorize_control::lifecycle_enabled()) {
+        auto reply = monitorize_control::exchange(monitorize_control::configured_endpoint(), "stream_stopped", monitorize_control::certificate_id(session.client_cert), std::to_string(session.launch_session_id), 0, 0, 0, 30000);
+        if (!reply.ok) {
+          BOOST_LOG(warning) << "Monitorize disconnect notification failed: " << reply.error;
+        }
+      }
       BOOST_LOG(debug) << "Session ended"sv;
     }
 
@@ -2238,6 +2258,14 @@ namespace stream {
       session.videoThread = std::jthread {videoThread, &session};
 
       session.state.store(state_e::RUNNING, std::memory_order_relaxed);
+      if (monitorize_control::lifecycle_enabled()) {
+        auto reply = monitorize_control::exchange(monitorize_control::configured_endpoint(), "stream_started", monitorize_control::certificate_id(session.client_cert), std::to_string(session.launch_session_id), 0, 0, 0, 2000);
+        if (!reply.ok) {
+          BOOST_LOG(warning) << "Monitorize stream notification failed: " << reply.error;
+          stop(session);
+        }
+      }
+
 
       // If this is the first session, invoke the platform callbacks
       if (++running_sessions == 1) {

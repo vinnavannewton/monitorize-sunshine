@@ -17,6 +17,7 @@
 #include "graphics.h"
 #include "pipewire.cpp"
 #include "src/platform/common.h"
+#include "src/monitorize_control.h"
 #include "src/video.h"
 
 using namespace std::literals;
@@ -133,6 +134,10 @@ namespace pipewire_node {
         }
       }
 
+      auto managed_target = monitorize_control::current_target();
+      if (monitorize_control::enabled()) {
+        target_node = managed_target ? managed_target->pipewire_node : 0;
+      }
       if (target_node == 0) {
         BOOST_LOG(error) << "[pipewire_node] No valid PipeWire node id specified in SUNSHINE_PIPEWIRE_NODE or output_name"sv;
         return -1;
@@ -179,6 +184,13 @@ namespace pipewire_node {
         } catch (...) {}
       }
 
+      if (monitorize_control::enabled() && managed_target) {
+        this->width = managed_target->width;
+        this->height = managed_target->height;
+        this->offset_x = managed_target->offset_x;
+        this->offset_y = managed_target->offset_y;
+      }
+
       BOOST_LOG(info) << "[pipewire_node] Direct stream node: "sv << target_node 
                       << " resolution: "sv << this->width << "x"sv << this->height
                       << " offset: "sv << this->offset_x << "x"sv << this->offset_y;
@@ -190,6 +202,10 @@ namespace pipewire_node {
 
 namespace platf {
   bool pipewire_node_available() {
+    if (monitorize_control::enabled()) {
+      auto target = monitorize_control::current_target();
+      return target && target->pipewire_node > 0;
+    }
     std::string env_node;
     if (lizardbyte::common::get_env("SUNSHINE_PIPEWIRE_NODE", env_node) && !env_node.empty()) {
       return true;
@@ -198,6 +214,10 @@ namespace platf {
   }
 
   std::vector<std::string> pipewire_node_display_names() {
+    if (monitorize_control::enabled()) {
+      auto target = monitorize_control::current_target();
+      return target && target->pipewire_node > 0 ? std::vector<std::string> {std::to_string(target->pipewire_node)} : std::vector<std::string> {};
+    }
     std::string env_node;
     if (lizardbyte::common::get_env("SUNSHINE_PIPEWIRE_NODE", env_node) && !env_node.empty()) {
       return {env_node};

@@ -56,6 +56,7 @@
 #endif
 
 // local includes
+#include "src/monitorize_control.h"
 #include "graphics.h"
 #include "misc.h"
 #include "src/config.h"
@@ -1277,10 +1278,19 @@ namespace platf {
     // Only re-probe if the GPU render device changed (hotplug, driver reload).
     // Full re-probing on every reconnect leaks ~20 MB due to FFmpeg CBS
     // allocations during HEVC/AV1 codec validation.
+    static std::string last_managed_target;
+    bool target_changed = false;
+    if (monitorize_control::enabled()) {
+      if (auto target = monitorize_control::current_target()) {
+        auto key = target->capture + ":" + target->output_name + ":" + std::to_string(target->pipewire_node) + ":" + std::to_string(target->width) + ":" + std::to_string(target->height) + ":" + std::to_string(target->fps);
+        target_changed = key != last_managed_target;
+        last_managed_target = std::move(key);
+      }
+    }
     static std::string last_render_device;
     auto current = platf::resolve_render_device();
     if (current == last_render_device) {
-      return false;
+      return target_changed;
     }
     last_render_device = current;
     return true;
@@ -1342,37 +1352,12 @@ namespace platf {
   }
 
   /**
-   * @brief Initialize the Linux high-precision timer file descriptor.
+   * @brief Re-evaluate the configured Linux capture backend after idle managed hotplug.
+   * @return Whether at least one explicitly selected capture source is available.
+   * @note Call only before streaming starts, after all old capture workers have joined.
    */
-  std::unique_ptr<deinit_t> init() {
-    // enable low latency mode for AMD
-    // https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/30039
-    lizardbyte::common::set_env("AMD_DEBUG", "lowlatencyenc");
-
-    // enable Vulkan video extensions for AMD RADV
-    lizardbyte::common::set_env("RADV_PERFTEST", "video_encode");
-    // Above is deprecated on Mesa 26.1+ and replaced by (keep both to ensure best compatibility):
-    lizardbyte::common::append_env("RADV_EXPERIMENTAL", "video_encode", ",");
-
-    // These are allowed to fail.
-    gbm::init();
-
-    window_system = window_system_e::NONE;
-#ifdef SUNSHINE_BUILD_WAYLAND
-    if (std::string v; lizardbyte::common::get_env("WAYLAND_DISPLAY", v)) {
-      window_system = window_system_e::WAYLAND;
-    }
-#endif
-#if defined(SUNSHINE_BUILD_X11) || defined(SUNSHINE_BUILD_CUDA)
-    if (std::string v; lizardbyte::common::get_env("DISPLAY", v) && window_system != window_system_e::WAYLAND) {
-      if (lizardbyte::common::get_env("WAYLAND_DISPLAY", v)) {
-        BOOST_LOG(warning) << "Wayland detected, yet sunshine will use X11 for screencasting, screencasting will only work on XWayland applications"sv;
-      }
-
-      window_system = window_system_e::X11;
-    }
-#endif
-
+  bool refresh_capture_sources() {
+    sources.reset();
 #ifdef SUNSHINE_BUILD_PIPEWIRE_NODE
     if ((config::video.capture.empty() || config::video.capture == "pipewire_node" || config::video.capture == "pipewire") && verify_pipewire_node()) {
       sources[source::PIPEWIRE_NODE] = true;
@@ -1413,6 +1398,45 @@ namespace platf {
 
     if (sources.none()) {
       BOOST_LOG(error) << "Unable to initialize capture method"sv;
+      return false;
+    }
+
+    return true;
+  }
+
+  /**
+   * @brief Initialize the Linux high-precision timer file descriptor.
+   */
+  std::unique_ptr<deinit_t> init() {
+    // enable low latency mode for AMD
+    // https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/30039
+    lizardbyte::common::set_env("AMD_DEBUG", "lowlatencyenc");
+
+    // enable Vulkan video extensions for AMD RADV
+    lizardbyte::common::set_env("RADV_PERFTEST", "video_encode");
+    // Above is deprecated on Mesa 26.1+ and replaced by (keep both to ensure best compatibility):
+    lizardbyte::common::append_env("RADV_EXPERIMENTAL", "video_encode", ",");
+
+    // These are allowed to fail.
+    gbm::init();
+
+    window_system = window_system_e::NONE;
+#ifdef SUNSHINE_BUILD_WAYLAND
+    if (std::string v; lizardbyte::common::get_env("WAYLAND_DISPLAY", v)) {
+      window_system = window_system_e::WAYLAND;
+    }
+#endif
+#if defined(SUNSHINE_BUILD_X11) || defined(SUNSHINE_BUILD_CUDA)
+    if (std::string v; lizardbyte::common::get_env("DISPLAY", v) && window_system != window_system_e::WAYLAND) {
+      if (lizardbyte::common::get_env("WAYLAND_DISPLAY", v)) {
+        BOOST_LOG(warning) << "Wayland detected, yet sunshine will use X11 for screencasting, screencasting will only work on XWayland applications"sv;
+      }
+
+      window_system = window_system_e::X11;
+    }
+#endif
+
+    if (!refresh_capture_sources() && !monitorize_control::enabled()) {
       return nullptr;
     }
 

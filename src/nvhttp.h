@@ -21,6 +21,10 @@
 /**
  * @brief Contains all the functions and variables related to the nvhttp (GameStream) server.
  */
+namespace rtsp_stream {
+  struct launch_session_t;
+}
+
 namespace nvhttp {
 
   /**
@@ -52,6 +56,12 @@ namespace nvhttp {
    * @examples_end
    */
   void start();
+
+  /**
+   * @brief Queue owned application/display cleanup for an expired managed RTSP handshake.
+   * @param session Expired launch generation; stale callbacks cannot clean newer leases.
+   */
+  void managed_launch_timeout(std::shared_ptr<rtsp_stream::launch_session_t> session);
 
   /**
    * @brief Setup the nvhttp server.

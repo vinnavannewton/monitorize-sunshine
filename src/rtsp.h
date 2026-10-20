@@ -52,6 +52,9 @@ namespace rtsp_stream {
    */
   void launch_session_raise(std::shared_ptr<launch_session_t> launch_session);
 
+  /** @brief Check whether a launch is waiting for its RTSP handshake. @return Whether this host is reserved by a pending launch. */
+  bool launch_session_pending();
+
   /**
    * @brief Clear state for the specified launch session.
    * @param launch_session_id The ID of the session to clear.

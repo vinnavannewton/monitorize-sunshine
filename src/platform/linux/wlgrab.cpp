@@ -4,6 +4,7 @@
  */
 // standard includes
 #include <thread>
+#include "src/monitorize_control.h"
 
 // local includes
 #include <gbm.h>
@@ -84,6 +85,12 @@ namespace wl {
       display.roundtrip();
 
       auto monitor = interface.monitors[0].get();
+      const char *exact = std::getenv("MONITORIZE_REQUIRE_EXACT_OUTPUT");
+      const bool require_exact = monitorize_control::enabled() || (exact && std::string_view(exact) == "1");
+      if (require_exact && display_name.empty()) {
+        BOOST_LOG(error) << "An exact Wayland output is required for this session";
+        return -1;
+      }
 
       if (!display_name.empty()) {
         // Match by xdg_output name first (stable across hotplug, e.g.
@@ -98,6 +105,10 @@ namespace wl {
           }
         }
         if (!matched) {
+          if (require_exact) {
+            BOOST_LOG(error) << "Requested Wayland output is unavailable; refusing monitor fallback: " << display_name;
+            return -1;
+          }
           auto streamedMonitor = util::from_view(display_name);
           if (streamedMonitor >= 0 && streamedMonitor < interface.monitors.size()) {
             monitor = interface.monitors[streamedMonitor].get();

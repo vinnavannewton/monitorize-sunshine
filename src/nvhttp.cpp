@@ -27,6 +27,7 @@
 #include "httpcommon.h"
 #include "logging.h"
 #include "network.h"
+#include "monitorize_control.h"
 #include "nvhttp.h"
 #include "platform/common.h"
 #include "process.h"
@@ -68,10 +69,22 @@ namespace nvhttp {
       context.use_private_key_file(private_key_file, boost::asio::ssl::context::pem);
     }
 
+    /**
+     * @brief Retrieve the verified certificate for the connection carrying this request.
+     * @param request Incoming HTTPS request.
+     * @return Verified PEM identity, or empty if the connection is no longer valid.
+     */
+    static std::string client_certificate(const std::shared_ptr<Request> &request) {
+      auto peer = request->remote_endpoint();
+      return verified_connections.lookup(peer.address().to_string() + ":" + std::to_string(peer.port()));
+    }
+
     std::function<int(SSL *)> verify;  ///< Callback that validates a client's TLS certificate after handshake.
     std::function<void(std::shared_ptr<Response>, std::shared_ptr<Request>)> on_verify_failed;  ///< Handler used to return the pairing challenge when client verification fails.
 
   protected:
+    inline static monitorize_control::certificate_registry verified_connections; ///< Certificates bound to accepted TLS connection lifetimes.
+
     boost::asio::ssl::context context;  ///< TLS server context configured with Sunshine's certificate and protocol policy.
 
     /**
@@ -122,6 +135,11 @@ namespace nvhttp {
               if (verify && !verify(session->connection->socket->native_handle())) {
                 this->write(session, on_verify_failed);
               } else {
+                crypto::x509_t certificate {SSL_get_peer_certificate(session->connection->socket->native_handle())};
+                if (certificate) {
+                  auto peer = session->connection->socket->lowest_layer().remote_endpoint();
+                  verified_connections.record(peer.address().to_string() + ":" + std::to_string(peer.port()), session->connection, crypto::pem(certificate));
+                }
                 this->read(session);
               }
             } else if (this->on_error) {
@@ -175,8 +193,6 @@ namespace nvhttp {
   client_t client_root;  ///< In-memory representation of the paired-client database.
   std::atomic<uint32_t> session_id_counter;  ///< Monotonic counter used to allocate GameStream session IDs.
 
-  // Set by TLS verify callback, read by launch/resume handler (single-threaded HTTPS server)
-  std::string last_verified_client_cert;  ///< Last client certificate accepted by the TLS verify callback.  // NOSONAR(cpp:S5421): intentionally mutable global
 
   /**
    * @brief Case-insensitive map used for HTTP headers and query parameters.
@@ -359,9 +375,10 @@ namespace nvhttp {
    *
    * @param host_audio Host audio.
    * @param args Arguments forwarded to the callable or parser.
+   * @param client_certificate Verified identity bound to the requesting TLS connection.
    * @return Constructed launch session object.
    */
-  std::shared_ptr<rtsp_stream::launch_session_t> make_launch_session(bool host_audio, const args_t &args) {
+  std::shared_ptr<rtsp_stream::launch_session_t> make_launch_session(bool host_audio, const args_t &args, const std::string &client_certificate) {
     auto launch_session = std::make_shared<rtsp_stream::launch_session_t>();
 
     launch_session->id = ++session_id_counter;
@@ -405,7 +422,7 @@ namespace nvhttp {
       launch_session->rtsp_iv_counter = 0;
     }
     launch_session->rtsp_url_scheme = launch_session->rtsp_cipher ? "rtspenc://"s : "rtsp://"s;
-    launch_session->client_cert = last_verified_client_cert;
+    launch_session->client_cert = client_certificate;
 
     // Generate the unique identifiers for this connection that we will send later during RTSP handshake
     unsigned char raw_payload[8];
@@ -867,6 +884,9 @@ namespace nvhttp {
    * @return Moonlight codec capability bitmask for the currently probed encoders.
    */
   uint32_t get_codec_mode_flags() {
+    if (monitorize_control::enabled()) {
+      return SCM_H264;
+    }
     uint32_t codec_mode_flags = SCM_H264;
     if (video::last_encoder_probe_supported_yuv444_for_codec[0]) {
       codec_mode_flags |= SCM_H264_HIGH8_444;
@@ -931,7 +951,7 @@ namespace nvhttp {
     tree.put("root.uniqueid", http::unique_id);
     tree.put("root.HttpsPort", net::map_port(PORT_HTTPS));
     tree.put("root.ExternalPort", net::map_port(PORT_HTTP));
-    tree.put("root.MaxLumaPixelsHEVC", video::active_hevc_mode > 1 ? "1869449984" : "0");
+    tree.put("root.MaxLumaPixelsHEVC", !monitorize_control::enabled() && video::active_hevc_mode > 1 ? "1869449984" : "0");
 
     // Only include the MAC address for requests sent from paired clients over HTTPS.
     // For HTTP requests, use a placeholder MAC address that Moonlight knows to ignore.
@@ -1015,11 +1035,138 @@ namespace nvhttp {
     for (auto &proc : proc::proc.get_apps()) {
       pt::ptree app;
 
-      app.put("IsHdrSupported"s, video::active_hevc_mode >= 3 ? 1 : 0);
+      app.put("IsHdrSupported"s, !monitorize_control::enabled() && video::active_hevc_mode >= 3 ? 1 : 0);
       app.put("AppTitle"s, proc.name);
       app.put("ID", proc.id);
 
       apps.push_back(std::make_pair("App", std::move(app)));
+    }
+  }
+
+  std::mutex managed_worker_mutex; ///< Protects registration of the bounded operation worker during host shutdown.
+  std::weak_ptr<thread_pool_util::ThreadPool> managed_operation_worker; ///< Allows RTSP timeouts to enqueue cleanup without retaining server lifetime.
+
+  thread_local std::shared_ptr<std::atomic_bool> managed_cancellation; ///< Cancellation belongs only to the serialized managed worker.
+
+  /** @brief Report cancellation before capture or application side effects. @param tree Response to populate. @return Whether this transaction was cancelled. */
+  bool managed_cancelled(pt::ptree &tree) {
+    if (!managed_cancellation || !managed_cancellation->load()) {
+      return false;
+    }
+    tree.put("root.<xmlattr>.status_code", 503);
+    tree.put("root.<xmlattr>.status_message", "Display preparation was cancelled");
+    tree.put("root.gamesession", 0);
+    tree.put("root.resume", 0);
+    return true;
+  }
+
+  /** @brief Write a bounded admission error on the HTTPS loop. @param response Client response. @param code HTTP-style GameStream status. @param message Diagnostic. */
+  void managed_failure(resp_https_t response, int code, const std::string &message) {
+    pt::ptree tree;
+    tree.put("root.<xmlattr>.status_code", code);
+    tree.put("root.<xmlattr>.status_message", message);
+    tree.put("root.gamesession", 0);
+    tree.put("root.resume", 0);
+    tree.put("root.cancel", 0);
+    std::ostringstream data;
+    pt::write_xml(data, tree);
+    response->write(data.str());
+    response->close_connection_after_response = true;
+  }
+
+  std::string managed_client; ///< Certificate owning the last prepared managed display.
+  std::string managed_request; ///< Generation owning the last prepared managed display.
+
+  /**
+   * @brief Prepare an authenticated client's exact display before probing or launching applications.
+   * @param session Validated launch request.
+   * @param args Client query including the requested mode.
+   * @param tree Error response to populate on failure.
+   * @param resume Whether an absent mode may reuse this owner's prepared display.
+   * @return Whether preparation succeeded, or this is a normal unmanaged host.
+   */
+  bool prepare_managed_display(const rtsp_stream::launch_session_t &session, const args_t &args, pt::ptree &tree, bool resume = false) {
+    if (!monitorize_control::enabled()) {
+      return true;
+    }
+    int width = 0, height = 0;
+    double fps = 0;
+    auto mode = get_arg(args, "mode", "");
+    if (resume && mode.empty() && managed_client == session.client_cert) {
+      if (auto target = monitorize_control::current_target()) {
+        width = target->width;
+        height = target->height;
+        fps = target->fps;
+      }
+    } else if (!monitorize_control::parse_mode(mode, width, height, fps)) {
+      tree.put("root.<xmlattr>.status_code", 400);
+      tree.put("root.<xmlattr>.status_message", "Invalid client display settings");
+      tree.put("root.gamesession", 0);
+      return false;
+    }
+    auto reply = monitorize_control::exchange(monitorize_control::configured_endpoint(), "prepare", monitorize_control::certificate_id(session.client_cert), std::to_string(session.id), width, height, fps, 20000, managed_cancellation);
+    if (reply.ok) {
+      managed_client = session.client_cert;
+      managed_request = std::to_string(session.id);
+    }
+    if (managed_cancelled(tree)) {
+      return false;
+    }
+    if (!reply.ok) {
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", reply.error);
+      tree.put("root.gamesession", 0);
+      return false;
+    }
+    config::video.capture = reply.target.capture;
+    config::video.output_name = reply.target.output_name;
+#ifdef __linux__
+    // Capture workers retain immutable snapshots; no process environment changes.
+    monitorize_control::bind_target(reply.target);
+    if (!platf::refresh_capture_sources()) {
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "Requested capture backend is unavailable");
+      tree.put("root.gamesession", 0);
+      return false;
+    }
+#endif
+    return true;
+  }
+
+  /**
+   * @brief Notify Monitorize of a failed launch without exposing private credentials in logs.
+   * @param session Prepared launch generation to abandon.
+   */
+  void abort_managed_display(const rtsp_stream::launch_session_t &session) {
+    if (monitorize_control::enabled()) {
+      auto reply = monitorize_control::exchange(monitorize_control::configured_endpoint(), "abort", monitorize_control::certificate_id(session.client_cert), std::to_string(session.id), 0, 0, 0, 2000);
+      if (!reply.ok) {
+        BOOST_LOG(warning) << "Monitorize launch cleanup failed: " << reply.error;
+      }
+      if (managed_request == std::to_string(session.id) && managed_client == session.client_cert) {
+        if (proc::proc.running() > 0) {
+          proc::proc.terminate();
+        }
+        managed_client.clear();
+        managed_request.clear();
+        monitorize_control::clear_target();
+      }
+    }
+  }
+
+  /**
+   * @brief Queue complete cleanup when a prepared launch never completes its RTSP handshake.
+   * @param session Expired launch generation.
+   */
+  void managed_launch_timeout(std::shared_ptr<rtsp_stream::launch_session_t> session) {
+    std::lock_guard lock(managed_worker_mutex);
+    if (auto worker = managed_operation_worker.lock()) {
+      worker->push([session] {
+        // A newer resume must not be terminated by an old timeout callback.
+        if (managed_request == std::to_string(session->id) && managed_client == session->client_cert) {
+          abort_managed_display(*session);
+        }
+      });
     }
   }
 
@@ -1046,7 +1193,7 @@ namespace nvhttp {
       response->write(data.str());
       response->close_connection_after_response = true;
 
-      if (revert_display_configuration) {
+      if (revert_display_configuration && !monitorize_control::enabled()) {
         display_device::revert_configuration();
       }
     });
@@ -1077,7 +1224,30 @@ namespace nvhttp {
     }
 
     host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
-    auto launch_session = make_launch_session(host_audio, args);
+    auto launch_session = make_launch_session(host_audio, args, SunshineHTTPSServer::client_certificate(request));
+    bool managed_prepared = false;
+    auto managed_cleanup = util::fail_guard([&]() {
+      if (managed_prepared) {
+        abort_managed_display(*launch_session);
+      }
+    });
+    if (monitorize_control::enabled() && (rtsp_stream::session_count() != 0 || rtsp_stream::launch_session_pending())) {
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "This display slot is already streaming");
+      tree.put("root.gamesession", 0);
+      return;
+    }
+
+    auto encryption_mode = net::encryption_mode_for_address(request->remote_endpoint().address());
+    if (!launch_session->rtsp_cipher && encryption_mode == config::ENCRYPTION_MODE_MANDATORY) {
+      BOOST_LOG(error) << "Rejecting client that cannot comply with mandatory encryption requirement"sv;
+
+      tree.put("root.<xmlattr>.status_code", 403);
+      tree.put("root.<xmlattr>.status_message", "Encryption is mandatory for this host but unsupported by the client");
+      tree.put("root.gamesession", 0);
+
+      return;
+    }
 
     if (rtsp_stream::session_count() == 0) {
       // The display should be restored in case something fails as there are no other sessions.
@@ -1086,7 +1256,13 @@ namespace nvhttp {
       // We want to prepare display only if there are no active sessions at
       // the moment. This should be done before probing encoders as it could
       // change the active displays.
-      display_device::configure_display(config::video, *launch_session);
+      managed_prepared = monitorize_control::enabled();
+      if (!prepare_managed_display(*launch_session, args, tree)) {
+        return;
+      }
+      if (!monitorize_control::enabled()) {
+        display_device::configure_display(config::video, *launch_session);
+      }
 
       // Probe encoders again before streaming to ensure our chosen
       // encoder matches the active GPU (which could have changed
@@ -1101,17 +1277,9 @@ namespace nvhttp {
       }
     }
 
-    auto encryption_mode = net::encryption_mode_for_address(request->remote_endpoint().address());
-    if (!launch_session->rtsp_cipher && encryption_mode == config::ENCRYPTION_MODE_MANDATORY) {
-      BOOST_LOG(error) << "Rejecting client that cannot comply with mandatory encryption requirement"sv;
-
-      tree.put("root.<xmlattr>.status_code", 403);
-      tree.put("root.<xmlattr>.status_message", "Encryption is mandatory for this host but unsupported by the client");
-      tree.put("root.gamesession", 0);
-
+    if (managed_cancelled(tree)) {
       return;
     }
-
     if (appid > 0) {
       auto err = proc::proc.execute((int) appid, launch_session);
       if (err) {
@@ -1135,10 +1303,14 @@ namespace nvhttp {
     );
     tree.put("root.gamesession", 1);
 
+    if (managed_cancelled(tree)) {
+      return;
+    }
     rtsp_stream::launch_session_raise(launch_session);
 
     // Stream was started successfully, we will revert the config when the app or session terminates
     revert_display_configuration = false;
+    managed_cleanup.disable();
   }
 
   /**
@@ -1192,13 +1364,42 @@ namespace nvhttp {
     if (no_active_sessions && args.find("localAudioPlayMode"s) != std::end(args)) {
       host_audio = util::from_view(get_arg(args, "localAudioPlayMode"));
     }
-    const auto launch_session = make_launch_session(host_audio, args);
+    const auto launch_session = make_launch_session(host_audio, args, SunshineHTTPSServer::client_certificate(request));
+    bool managed_prepared = false;
+    auto managed_cleanup = util::fail_guard([&]() {
+      if (managed_prepared) {
+        abort_managed_display(*launch_session);
+      }
+    });
+    if (monitorize_control::enabled() && (!no_active_sessions || rtsp_stream::launch_session_pending())) {
+      tree.put("root.<xmlattr>.status_code", 503);
+      tree.put("root.<xmlattr>.status_message", "This display slot is already streaming");
+      tree.put("root.resume", 0);
+      return;
+    }
+
+    auto encryption_mode = net::encryption_mode_for_address(request->remote_endpoint().address());
+    if (!launch_session->rtsp_cipher && encryption_mode == config::ENCRYPTION_MODE_MANDATORY) {
+      BOOST_LOG(error) << "Rejecting client that cannot comply with mandatory encryption requirement"sv;
+
+      tree.put("root.<xmlattr>.status_code", 403);
+      tree.put("root.<xmlattr>.status_message", "Encryption is mandatory for this host but unsupported by the client");
+      tree.put("root.gamesession", 0);
+
+      return;
+    }
 
     if (no_active_sessions) {
       // We want to prepare display only if there are no active sessions at
       // the moment. This should be done before probing encoders as it could
       // change the active displays.
-      display_device::configure_display(config::video, *launch_session);
+      managed_prepared = monitorize_control::enabled();
+      if (!prepare_managed_display(*launch_session, args, tree, true)) {
+        return;
+      }
+      if (!monitorize_control::enabled()) {
+        display_device::configure_display(config::video, *launch_session);
+      }
 
       // Probe encoders again before streaming to ensure our chosen
       // encoder matches the active GPU (which could have changed
@@ -1213,17 +1414,6 @@ namespace nvhttp {
       }
     }
 
-    auto encryption_mode = net::encryption_mode_for_address(request->remote_endpoint().address());
-    if (!launch_session->rtsp_cipher && encryption_mode == config::ENCRYPTION_MODE_MANDATORY) {
-      BOOST_LOG(error) << "Rejecting client that cannot comply with mandatory encryption requirement"sv;
-
-      tree.put("root.<xmlattr>.status_code", 403);
-      tree.put("root.<xmlattr>.status_message", "Encryption is mandatory for this host but unsupported by the client");
-      tree.put("root.gamesession", 0);
-
-      return;
-    }
-
     tree.put("root.<xmlattr>.status_code", 200);
     tree.put(
       "root.sessionUrl0",
@@ -1236,7 +1426,11 @@ namespace nvhttp {
     );
     tree.put("root.resume", 1);
 
+    if (managed_cancelled(tree)) {
+      return;
+    }
     rtsp_stream::launch_session_raise(launch_session);
+    managed_cleanup.disable();
   }
 
   /**
@@ -1257,6 +1451,13 @@ namespace nvhttp {
       response->close_connection_after_response = true;
     });
 
+    if (monitorize_control::enabled() && !managed_client.empty() && managed_client != SunshineHTTPSServer::client_certificate(request)) {
+      tree.put("root.cancel", 0);
+      tree.put("root.<xmlattr>.status_code", 403);
+      tree.put("root.<xmlattr>.status_message", "This display belongs to another client");
+      return;
+    }
+
     tree.put("root.cancel", 1);
     tree.put("root.<xmlattr>.status_code", 200);
 
@@ -1266,8 +1467,20 @@ namespace nvhttp {
       proc::proc.terminate();
     }
 
+    if (monitorize_control::enabled() && !managed_request.empty()) {
+      auto reply = monitorize_control::exchange(monitorize_control::configured_endpoint(), "release", monitorize_control::certificate_id(SunshineHTTPSServer::client_certificate(request)), managed_request, 0, 0, 0, 2000);
+      if (!reply.ok) {
+        BOOST_LOG(warning) << "Monitorize display release failed: " << reply.error;
+      }
+      managed_client.clear();
+      managed_request.clear();
+      monitorize_control::clear_target();
+    }
+
     // The config needs to be reverted regardless of whether "proc::proc.terminate()" was called or not.
-    display_device::revert_configuration();
+    if (!monitorize_control::enabled()) {
+      display_device::revert_configuration();
+    }
   }
 
   /**
@@ -1325,6 +1538,14 @@ namespace nvhttp {
     // resume doesn't always get the parameter "localAudioPlayMode"
     // launch will store it in host_audio
     bool host_audio {};
+    monitorize_control::operation_gate managed_gate;
+    std::shared_ptr<thread_pool_util::ThreadPool> managed_worker;
+    if (monitorize_control::enabled()) {
+      managed_worker = std::make_shared<thread_pool_util::ThreadPool>(1);
+      std::lock_guard lock(managed_worker_mutex);
+      managed_operation_worker = managed_worker;
+    }
+
 
     https_server_t https_server {config::nvhttp.cert, config::nvhttp.pkey};
     http_server_t http_server;
@@ -1377,7 +1598,6 @@ namespace nvhttp {
         return verified;
       }
 
-      last_verified_client_cert = pem;
       verified = 1;
 
       return verified;
@@ -1405,13 +1625,57 @@ namespace nvhttp {
     };
     https_server.resource["^/applist$"]["GET"] = applist;
     https_server.resource["^/appasset$"]["GET"] = appasset;
-    https_server.resource["^/launch$"]["GET"] = [&host_audio](auto resp, auto req) {
-      launch(host_audio, resp, req);
+    auto dispatch_launch = [&](bool resuming, resp_https_t resp, req_https_t req) {
+      if (!managed_worker) {
+        if (resuming) {
+          resume(host_audio, resp, req);
+        } else {
+          launch(host_audio, resp, req);
+        }
+        return;
+      }
+      auto cancellation = managed_gate.begin(SunshineHTTPSServer::client_certificate(req));
+      if (!cancellation) {
+        managed_failure(resp, 503, "This display slot is busy preparing another request");
+        return;
+      }
+      managed_worker->push([&, resuming, resp, req, cancellation] {
+        managed_cancellation = cancellation;
+        auto finished = util::fail_guard([&] {
+          managed_cancellation.reset();
+          managed_gate.finish_launch();
+        });
+        try {
+          if (resuming) {
+            resume(host_audio, resp, req);
+          } else {
+            launch(host_audio, resp, req);
+          }
+        } catch (const std::exception &) {
+          managed_failure(resp, 503, "Managed display launch failed");
+        }
+      });
     };
-    https_server.resource["^/resume$"]["GET"] = [&host_audio](auto resp, auto req) {
-      resume(host_audio, resp, req);
+    https_server.resource["^/launch$"]["GET"] = [&](auto resp, auto req) {
+      dispatch_launch(false, resp, req);
     };
-    https_server.resource["^/cancel$"]["GET"] = cancel;
+    https_server.resource["^/resume$"]["GET"] = [&](auto resp, auto req) {
+      dispatch_launch(true, resp, req);
+    };
+    https_server.resource["^/cancel$"]["GET"] = [&](auto resp, auto req) {
+      if (!managed_worker) {
+        cancel(resp, req);
+        return;
+      }
+      if (!managed_gate.cancel(SunshineHTTPSServer::client_certificate(req))) {
+        managed_failure(resp, 403, "Only the owning client can cancel this pending display request");
+        return;
+      }
+      managed_worker->push([&, resp, req] {
+        auto finished = util::fail_guard([&] { managed_gate.finish_cancel(); });
+        cancel(resp, req);
+      });
+    };
 
     https_server.config.reuse_address = true;
     https_server.config.address = net::get_bind_address(address_family);
@@ -1454,6 +1718,17 @@ namespace nvhttp {
 
     ssl.join();
     tcp.join();
+    if (managed_worker) {
+      managed_gate.shutdown();
+      {
+        std::lock_guard lock(managed_worker_mutex);
+        managed_operation_worker.reset();
+      }
+      // Drain the bounded launch/cancel sequence before its captured server state expires.
+      managed_worker->push([] {}).wait();
+      managed_worker->stop();
+      managed_worker->join();
+    }
   }
 
   void erase_all_clients() {

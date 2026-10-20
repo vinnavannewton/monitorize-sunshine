@@ -24,6 +24,7 @@
 #include "httpcommon.h"
 #include "logging.h"
 #include "main.h"
+#include "monitorize_control.h"
 #include "nvhttp.h"
 #include "process.h"
 #include "system_tray.h"
@@ -404,7 +405,10 @@ int main(int argc, char *argv[]) {
     BOOST_LOG(warning) << "No gamepad input is available"sv;
   }
 
-  if (video::probe_encoders()) {
+  if (monitorize_control::enabled()) {
+    BOOST_LOG(info) << monitorize_control::protocol_marker << "; waiting for client display preparation";
+    BOOST_LOG(info) << monitorize_control::layout_protocol_marker;
+  } else if (video::probe_encoders()) {
     BOOST_LOG(error) << "Video failed to find working encoder"sv;
   }
 

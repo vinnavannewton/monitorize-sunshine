@@ -26,7 +26,9 @@ extern "C" {
 #include "globals.h"
 #include "input.h"
 #include "logging.h"
+#include "monitorize_control.h"
 #include "network.h"
+#include "nvhttp.h"
 #include "rtsp.h"
 #include "stream.h"
 #include "sync.h"
@@ -607,6 +609,9 @@ namespace rtsp_stream {
           auto discarded = launch_event.pop(0s);
           if (discarded) {
             BOOST_LOG(debug) << "Event timeout: "sv << discarded->unique_id;
+            if (monitorize_control::enabled()) {
+              nvhttp::managed_launch_timeout(std::move(discarded));
+            }
           }
         }
       });
@@ -745,6 +750,11 @@ namespace rtsp_stream {
     server.session_raise(std::move(launch_session));
   }
 
+  /** @brief Check whether a launch is waiting for its RTSP handshake. @return Whether the pending launch event is set. */
+  bool launch_session_pending() {
+    return static_cast<bool>(server.launch_event.view(0s));
+  }
+
   void launch_session_clear(uint32_t launch_session_id) {
     server.session_clear(launch_session_id);
   }
@@ -757,6 +767,10 @@ namespace rtsp_stream {
   }
 
   void terminate_sessions() {
+    if (monitorize_control::enabled()) {
+      // Do not let a previously accepted /launch begin RTSP after explicit Quit.
+      server.launch_event.pop(0s);
+    }
     server.clear(true);
     input::terminate_gamepads();
   }

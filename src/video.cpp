@@ -31,6 +31,7 @@ extern "C" {
 #include "globals.h"
 #include "input.h"
 #include "logging.h"
+#include "monitorize_control.h"
 #include "nvenc/nvenc_encoder.h"
 #include "platform/common.h"
 #include "sync.h"
@@ -1452,6 +1453,12 @@ namespace video {
   void refresh_displays(platf::mem_type_e dev_type, std::vector<std::string> &display_names, int &current_display_index) {
     // It is possible that the output name may be empty even if it wasn't before (device disconnected) or vice-versa
     const auto output_name {display_device::map_output_name(config::video.output_name)};
+    if (monitorize_control::enabled()) {
+      // A vanished owned output must never switch capture to a physical screen.
+      display_names = {output_name};
+      current_display_index = 0;
+      return;
+    }
     std::string current_display_name;
 
     // If we have a current display index, let's start with that
@@ -1539,6 +1546,7 @@ namespace video {
     int display_p = -1;
     refresh_displays(encoder.platform_formats->dev_type, display_names, display_p);
     auto disp = platf::display(encoder.platform_formats->dev_type, display_names[display_p], capture_ctxs.front().config);
+    auto layout_generation = monitorize_control::layout_generation.load();
     if (!disp) {
       return;
     }
@@ -1671,7 +1679,8 @@ namespace video {
           capture_ctxs.emplace_back(std::move(*capture_ctx_queue->pop()));
         }
 
-        if (switch_display_event->peek()) {
+        if (switch_display_event->peek() || layout_generation != monitorize_control::layout_generation.load()) {
+          layout_generation = monitorize_control::layout_generation.load();
           artificial_reinit = true;
           return false;
         }
@@ -2684,6 +2693,7 @@ namespace video {
     }
 
     auto ec = platf::capture_e::ok;
+    auto layout_generation = monitorize_control::layout_generation.load();
     while (encode_session_ctx_queue.running()) {
       auto push_captured_image_callback = [&](std::shared_ptr<platf::img_t> &&img, bool frame_captured) -> bool {
         while (encode_session_ctx_queue.peek()) {
@@ -2750,7 +2760,7 @@ namespace video {
           ++pos;
         })
 
-        if (switch_display_event->peek()) {
+        if (switch_display_event->peek() || layout_generation != monitorize_control::layout_generation.load()) {
           ec = platf::capture_e::reinit;
           return false;
         }
