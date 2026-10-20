@@ -406,6 +406,10 @@ int main(int argc, char *argv[]) {
   }
 
   if (monitorize_control::enabled()) {
+    if (video::probe_listener_codecs()) {
+      BOOST_LOG(fatal) << "MONITORIZE_CODEC_PROBE_FAILED: selected encoder/codec unavailable without a display";
+      return 1;
+    }
     BOOST_LOG(info) << monitorize_control::protocol_marker << "; waiting for client display preparation";
     BOOST_LOG(info) << monitorize_control::layout_protocol_marker;
   } else if (video::probe_encoders()) {

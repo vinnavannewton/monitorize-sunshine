@@ -885,7 +885,10 @@ namespace nvhttp {
    */
   uint32_t get_codec_mode_flags() {
     if (monitorize_control::enabled()) {
-      return SCM_H264;
+      const auto supported = video::listener_codec_support.load();
+      return (supported & 1U ? SCM_H264 : 0U) |
+             (supported & 2U ? SCM_HEVC : 0U) |
+             (supported & 4U ? SCM_AV1_MAIN8 : 0U);
     }
     uint32_t codec_mode_flags = SCM_H264;
     if (video::last_encoder_probe_supported_yuv444_for_codec[0]) {
@@ -951,7 +954,7 @@ namespace nvhttp {
     tree.put("root.uniqueid", http::unique_id);
     tree.put("root.HttpsPort", net::map_port(PORT_HTTPS));
     tree.put("root.ExternalPort", net::map_port(PORT_HTTP));
-    tree.put("root.MaxLumaPixelsHEVC", !monitorize_control::enabled() && video::active_hevc_mode > 1 ? "1869449984" : "0");
+    tree.put("root.MaxLumaPixelsHEVC", (monitorize_control::enabled() ? (video::listener_codec_support.load() & 2U) != 0 : video::active_hevc_mode > 1) ? "1869449984" : "0");
 
     // Only include the MAC address for requests sent from paired clients over HTTPS.
     // For HTTP requests, use a placeholder MAC address that Moonlight knows to ignore.

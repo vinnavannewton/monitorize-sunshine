@@ -22,6 +22,7 @@ extern "C" {
 #include <boost/bind.hpp>
 
 // local includes
+#include "listener_codec_policy.h"
 #include "config.h"
 #include "globals.h"
 #include "input.h"
@@ -1289,10 +1290,8 @@ namespace rtsp_stream {
       config.monitor.bitrate = (int) configuredBitrateKbps;
     }
 
-    const auto forced_video_format = config::video.av1_mode >= 2 ? 2 :
-                                      config::video.hevc_mode >= 2 ? 1 :
-                                                                          -1;
-    if (forced_video_format >= 0 && config.monitor.videoFormat != forced_video_format) {
+    const auto forced_video_format = listener_codec::forced_format(config::video.hevc_mode, config::video.av1_mode);
+    if (!listener_codec::accepts(config.monitor.videoFormat, config::video.hevc_mode, config::video.av1_mode)) {
       BOOST_LOG(error) << "MONITORIZE_STRICT_CODEC_REJECTED: configured codec "sv
                        << forced_video_format << " but client requested "sv
                        << config.monitor.videoFormat;

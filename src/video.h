@@ -3,6 +3,7 @@
  * @brief Declarations for video.
  */
 #pragma once
+#include <atomic>
 
 // standard includes
 #include <chrono>
@@ -708,6 +709,8 @@ namespace video {
    * @return 0 when a usable encoder is selected; nonzero when probing fails.
    */
   int probe_encoders();
+  int probe_listener_codecs();
+  extern std::atomic<unsigned> listener_codec_support;
 
   // Several NTSC standard refresh rates are hardcoded here, because their
   // true rate requires a denominator of 1001. ffmpeg's av_d2q() would assume it could

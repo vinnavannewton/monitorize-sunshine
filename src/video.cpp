@@ -32,6 +32,10 @@ extern "C" {
 #include "input.h"
 #include "logging.h"
 #include "monitorize_control.h"
+#include "listener_codec_policy.h"
+#ifdef __linux__
+#include "listener_probe_display.h"
+#endif
 #include "nvenc/nvenc_encoder.h"
 #include "platform/common.h"
 #include "sync.h"
@@ -1416,6 +1420,8 @@ namespace video {
   };
 
   static encoder_t *chosen_encoder;
+  static thread_local bool listener_codec_probe = false;
+  std::atomic<unsigned> listener_codec_support {0};
   int active_hevc_mode;  ///< HEVC mode selected by the most recent encoder probe.
   int active_av1_mode;  ///< AV1 mode selected by the most recent encoder probe.
   bool last_encoder_probe_supported_ref_frames_invalidation = false;  ///< Whether the last probe found reference-frame invalidation support.
@@ -1430,6 +1436,12 @@ namespace video {
    * @param config Configuration values to apply.
    */
   void reset_display(std::shared_ptr<platf::display_t> &disp, const platf::mem_type_e &type, const std::string &display_name, const config_t &config) {
+#ifdef __linux__
+    if (listener_codec_probe) {
+      disp = std::make_shared<listener_probe_display>(type);
+      return;
+    }
+#endif
     // We try this twice, in case we still get an error on reinitialization
     for (int x = 0; x < 2; ++x) {
       disp.reset();
@@ -3127,8 +3139,8 @@ namespace video {
       encoder.av1.capabilities.reset();
     }
 
-    // Test HDR and YUV444 support
-    {
+    // Listener preflight advertises SDR 4:2:0 only; real capture probes the rest.
+    if (!listener_codec_probe) {
       auto test_yuv444 = [&](auto &flag_map, auto video_format) {
         const config_t config = {1920, 1080, 60, 6000, 1000, 1, 0, 1, video_format, 0, 1};
 
@@ -3202,6 +3214,13 @@ namespace video {
       test_yuv444_hdr(encoder.av1, 2);
     }
 
+    if (listener_codec_probe) {
+      for (auto *codec : {&encoder.h264, &encoder.hevc, &encoder.av1}) {
+        (*codec)[encoder_t::YUV444] = false;
+        (*codec)[encoder_t::DYNAMIC_RANGE] = false;
+        (*codec)[encoder_t::DYNAMIC_RANGE_YUV444] = false;
+      }
+    }
     encoder.h264[encoder_t::VUI_PARAMETERS] = encoder.h264[encoder_t::VUI_PARAMETERS] && !config::sunshine.flags[config::flag::FORCE_VIDEO_HEADER_REPLACE];
     encoder.hevc[encoder_t::VUI_PARAMETERS] = encoder.hevc[encoder_t::VUI_PARAMETERS] && !config::sunshine.flags[config::flag::FORCE_VIDEO_HEADER_REPLACE];
 
@@ -3214,6 +3233,24 @@ namespace video {
 
     fg.disable();
     return true;
+  }
+
+  int probe_listener_codecs() {
+#ifdef __linux__
+    listener_codec_probe = true;
+    auto reset = util::fail_guard([] { listener_codec_probe = false; chosen_encoder = nullptr; });
+    const int result = probe_encoders();
+    if (result || !chosen_encoder) return -1;
+    unsigned tested = chosen_encoder->h264[encoder_t::PASSED] ? 1U : 0U;
+    if (chosen_encoder->hevc[encoder_t::PASSED]) tested |= 2U;
+    if (chosen_encoder->av1[encoder_t::PASSED]) tested |= 4U;
+    listener_codec_support.store(listener_codec::advertise(tested, config::video.hevc_mode, config::video.av1_mode));
+    if (!listener_codec_support.load()) return -1;
+    BOOST_LOG(info) << listener_codec::protocol_marker << "; tested codec mask=" << listener_codec_support.load();
+    return 0;
+#else
+    return -1;
+#endif
   }
 
   int probe_encoders() {
