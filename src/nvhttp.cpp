@@ -1919,14 +1919,8 @@ namespace nvhttp {
         return verified;
       }
 
-      // Check if this client is enabled
-      auto pem = crypto::pem(x509);
-      auto [enabled, client_name] = get_client_status(pem);
-      if (!enabled) {
-        BOOST_LOG(info) << "Client is disabled -- denied"sv;
-        return verified;
-      }
-
+      // verify_client_certificate() already checks the exact enabled identity
+      // while this lock is held. Metadata lookup takes the same mutex separately.
       verified = 1;
 
       return verified;
