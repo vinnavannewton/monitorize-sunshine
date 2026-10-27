@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <filesystem>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -49,6 +50,15 @@ namespace proc {
   namespace pt = boost::property_tree;
 
   proc_t proc;  ///< Global process registry used to track and terminate child processes.
+
+  /**
+   * @brief Serialize registry updates with session launch, cleanup and snapshots.
+   * @return Recursive mutex allowing execute/running to call terminate safely.
+   */
+  std::recursive_mutex &registry_mutex() {
+    static std::recursive_mutex mutex;
+    return mutex;
+  }
 
   /**
    * @brief RAII helper that runs shutdown cleanup when destroyed.
@@ -154,6 +164,7 @@ namespace proc {
   }
 
   int proc_t::execute(int app_id, std::shared_ptr<rtsp_stream::launch_session_t> launch_session) {
+    std::lock_guard lock {registry_mutex()};
     // Ensure starting from a clean slate
     terminate();
 
@@ -289,6 +300,7 @@ namespace proc {
   }
 
   int proc_t::running() {
+    std::lock_guard lock {registry_mutex()};
 #ifndef _WIN32
     // On POSIX OSes, we must periodically wait for our children to avoid
     // them becoming zombies. This must be synchronized carefully with
@@ -324,6 +336,7 @@ namespace proc {
   }
 
   void proc_t::terminate() {
+    std::lock_guard lock {registry_mutex()};
     input::terminate_gamepads();
     std::error_code ec;
     placebo = false;
@@ -381,11 +394,17 @@ namespace proc {
     return _apps;
   }
 
+  std::vector<ctx_t> proc_t::get_apps_snapshot() const {
+    std::lock_guard lock {registry_mutex()};
+    return _apps;
+  }
+
   // Gets application image from application list.
   // Returns image from assets directory if found there.
   // Returns default image if image configuration is not set.
   // Returns http content-type header compatible image type.
   std::string proc_t::get_app_image(int app_id) {
+    std::lock_guard lock {registry_mutex()};
     auto iter = std::find_if(_apps.begin(), _apps.end(), [&app_id](const auto app) {
       return app.id == std::to_string(app_id);
     });
@@ -395,7 +414,23 @@ namespace proc {
   }
 
   std::string proc_t::get_last_run_app_name() {
+    std::lock_guard lock {registry_mutex()};
     return _app.name;
+  }
+
+  void proc_t::update_apps_and_env(proc_t &&other) {
+    std::lock_guard lock {registry_mutex()};
+    if (_app_id > 0 || placebo) {
+      // Preserve session-specific environment variables for the running app
+      for (const auto &var : _env) {
+        std::string name = var.get_name();
+        if (name.find("SUNSHINE_APP_") == 0 || name.find("SUNSHINE_CLIENT_") == 0) {
+          other._env[name] = var.to_string();
+        }
+      }
+    }
+    _env = std::move(other._env);
+    _apps = std::move(other._apps);
   }
 
   proc_t::~proc_t() {
@@ -802,12 +837,39 @@ namespace proc {
 
   /**
    * @brief Refresh cached platform state from the operating system.
+   *
+   * The registry caches both the configuration path and its last successful modification time.
+   * If the file has been modified since it was last parsed (or if it has never been parsed),
+   * it will be re-parsed to update the app list.
+   *
+   * A registry-owned optional is used rather than a bare file_time_type because value-initialized
+   * file_time_type{} is not a reliable "never parsed" sentinel. On some toolchains
+   * (e.g. MSYS2 UCRT64 GCC 16.2), file_time_type::clock::now() compares
+   * less-or-equal to file_time_type{}, which would cause the initial parse to be skipped.
+   *
+   * When an app is currently running, only the cached app configuration list and environment
+   * are updated — active process state (_app_id, _process, _process_group, etc.) is preserved
+   * so that the in-flight streaming session can still be terminated properly.
    */
   void refresh(const std::string &file_name) {
-    auto proc_opt = proc::parse(file_name);
+    std::lock_guard lock {registry_mutex()};
+    std::error_code path_error;
+    auto path = std::filesystem::absolute(file_name, path_error).lexically_normal();
+    if (path_error) {
+      path = file_name;
+    }
+    std::error_code time_error;
+    const auto current_time = std::filesystem::last_write_time(path, time_error);
+    if (!time_error && proc._apps_file_update && path == proc._apps_file &&
+        current_time == *proc._apps_file_update) {
+      return;
+    }
 
-    if (proc_opt) {
-      proc = std::move(*proc_opt);
+    auto parsed = proc::parse(file_name);
+    if (parsed) {
+      proc.update_apps_and_env(std::move(*parsed));
+      proc._apps_file = std::move(path);
+      proc._apps_file_update = time_error ? std::nullopt : std::make_optional(current_time);
     }
   }
 }  // namespace proc

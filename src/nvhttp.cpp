@@ -1361,6 +1361,7 @@ namespace nvhttp {
    */
   void applist(resp_https_t response, req_https_t request) {
     print_req<SunshineHTTPS>(request);
+    proc::refresh(config::stream.file_apps);
 
     pt::ptree tree;
 
@@ -1376,7 +1377,7 @@ namespace nvhttp {
 
     apps.put("<xmlattr>.status_code", 200);
 
-    for (auto &proc : proc::proc.get_apps()) {
+    for (const auto &proc : proc::proc.get_apps_snapshot()) {
       pt::ptree app;
 
       app.put("IsHdrSupported"s, !monitorize_control::enabled() && video::active_hevc_mode >= 3 ? 1 : 0);

@@ -8,6 +8,12 @@ the build directory.
 
 The project uses gtest as a test framework.
 
+Sunshine tests must include `tests/tests_common.h` using the appropriate relative path, rather than
+including `<gtest/gtest.h>` directly. The common header provides shared BaseTest setup and output capture.
+
+Group test headers first under `// test includes`, followed by `// standard includes`, `// lib includes`,
+and `// local includes`, with a blank line between groups. Preserve documented include-order dependencies.
+
 When adding localization do not update any language other than `en`. This also means to exclude en-US or other variants.
 
 Always add or update doxygen documentation.

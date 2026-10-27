@@ -132,6 +132,11 @@ namespace proc {
      */
     std::vector<ctx_t> &get_apps();
     /**
+     * @brief Copy applications while serialized against refresh and launch.
+     * @return Independent application list safe for an HTTP response to iterate.
+     */
+    std::vector<ctx_t> get_apps_snapshot() const;
+    /**
      * @brief Get app image.
      *
      * @param app_id App ID.
@@ -149,7 +154,30 @@ namespace proc {
      */
     void terminate();
 
+    /**
+     * @brief Update the cached app list and environment without disturbing running process state.
+     *
+     * This replaces only the application configuration data (_apps and _env) from a newly parsed
+     * proc_t, preserving the current _app_id, _process, _process_group, and other fields that
+     * track an in-flight streaming session.
+     *
+     * @param other The newly parsed proc_t whose apps and env will be moved into this instance.
+     */
+    void update_apps_and_env(proc_t &&other);
+
+#ifdef SUNSHINE_TESTS
+    /**
+     * @brief Get the current process environment (strictly for unit tests).
+     */
+    const boost::process::v1::environment &get_env() const {
+      return _env;
+    }
+#endif
+
   private:
+    friend void refresh(const std::string &file_name);  ///< Refresh owns the registry's successful-parse cache.
+    std::filesystem::path _apps_file;  ///< Configuration path associated with the cached application list.
+    std::optional<std::filesystem::file_time_type> _apps_file_update;  ///< Timestamp of the last successful parse.
     int _app_id;
 
     boost::process::v1::environment _env;
