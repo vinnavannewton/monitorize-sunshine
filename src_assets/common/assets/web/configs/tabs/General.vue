@@ -89,7 +89,7 @@ function removeCmd(index) {
 
     <!-- Global Prep Commands -->
     <div id="global_prep_cmd" class="mb-3 d-flex flex-column">
-      <label class="form-label">{{ $t('config.global_prep_cmd') }}</label>
+      <div class="form-label">{{ $t('config.global_prep_cmd') }}</div>
       <div class="form-text">{{ $t('config.global_prep_cmd_desc') }}</div>
       <table class="table" v-if="config.global_prep_cmd.length > 0">
         <thead>
@@ -103,12 +103,14 @@ function removeCmd(index) {
         </tr>
         </thead>
         <tbody>
-        <tr v-for="(c, i) in config.global_prep_cmd">
+        <tr v-for="(c, i) in config.global_prep_cmd" :key="i">
           <td>
-            <input type="text" class="form-control monospace" v-model="c.do" />
+            <label :for="`prep-cmd-do-${i}`" class="visually-hidden">{{ $t('_common.do_cmd') }}</label>
+            <input :id="`prep-cmd-do-${i}`" type="text" class="form-control monospace" v-model="c.do" />
           </td>
           <td>
-            <input type="text" class="form-control monospace" v-model="c.undo" />
+            <label :for="`prep-cmd-undo-${i}`" class="visually-hidden">{{ $t('_common.undo_cmd') }}</label>
+            <input :id="`prep-cmd-undo-${i}`" type="text" class="form-control monospace" v-model="c.undo" />
           </td>
           <td v-if="platform === 'windows'" class="align-middle">
             <Checkbox :id="'prep-cmd-admin-' + i"
@@ -132,9 +134,21 @@ function removeCmd(index) {
         &plus; {{ $t('config.add') }}
       </button>
     </div>
+
+    <!-- Notify Pre-Releases -->
+    <Checkbox class="mb-3"
+              id="notify_pre_releases"
+              locale-prefix="config"
+              v-model="config.notify_pre_releases"
+              default="false"
+    ></Checkbox>
+
+    <!-- Enable system tray -->
+    <Checkbox class="mb-3"
+              id="system_tray"
+              locale-prefix="config"
+              v-model="config.system_tray"
+              default="true"
+    ></Checkbox>
   </div>
 </template>
-
-<style scoped>
-
-</style>

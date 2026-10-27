@@ -23,7 +23,7 @@ namespace video {
       width=env_width=1920; height=env_height=1080;
     }
     platf::capture_e capture(const push_captured_image_cb_t &, const pull_free_image_cb_t &, bool *) override {
-      return platf::capture_e::error; // This object must never capture a stream.
+      return platf::capture_e::capture_error; // This object must never capture a stream.
     }
     std::shared_ptr<platf::img_t> alloc_img() override { return std::make_shared<image>(width,height); }
     int dummy_img(platf::img_t *) override { return 0; }

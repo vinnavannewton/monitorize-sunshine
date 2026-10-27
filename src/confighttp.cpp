@@ -8,6 +8,7 @@
 
 // standard includes
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <filesystem>
 #include <format>
@@ -27,12 +28,19 @@
 #include <Simple-Web-Server/crypto.hpp>
 #include <Simple-Web-Server/server_https.hpp>
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
   #include "platform/virtualhid_input.h"
+#endif
+
+#ifdef _WIN32
   #include "platform/windows/misc.h"
   #include "platform/windows/utf_utils.h"
 
   #include <Windows.h>
+#elif defined(__APPLE__)
+  #include "platform/macos/misc.h"
+
+  #include <CoreFoundation/CoreFoundation.h>
 #endif
 
 // local includes
@@ -43,10 +51,12 @@
 #include "file_handler.h"
 #include "globals.h"
 #include "httpcommon.h"
+#include "input.h"
 #include "logging.h"
 #include "network.h"
 #include "nvhttp.h"
 #include "platform/common.h"
+#include "platform/permissions.h"
 #include "process.h"
 #include "rtsp.h"
 #include "system_tray.h"
@@ -82,6 +92,12 @@ namespace confighttp {
 
   namespace {
     using license_status_provider_t = std::function<lvh::LicenseResult()>;  ///< Provider for the current libvirtualhid license status.
+#ifdef SUNSHINE_TESTS
+    std::optional<nlohmann::json> permission_status_override;  ///< Deterministic permission statuses for HTTP tests.
+#endif
+#if defined(linux) || defined(__FreeBSD__) || defined(SUNSHINE_TESTS)
+    using portal_token_path_provider_t = std::function<fs::path()>;  ///< Provider for the XDG Portal token path.
+#endif
 
     /**
      * @brief Return the current libvirtualhid license status provider.
@@ -100,6 +116,26 @@ namespace confighttp {
 #endif
       return status_provider;
     }
+
+#if defined(linux) || defined(__FreeBSD__) || defined(SUNSHINE_TESTS)
+    /**
+     * @brief Return the path provider for the saved XDG Portal restore token.
+     *
+     * @return Path provider for the current build.
+     */
+    auto &portal_token_path_provider() {
+  #ifdef SUNSHINE_TESTS
+      static portal_token_path_provider_t path_provider = []() {
+        return platf::get_xdg_restore_token_path();
+      };
+  #else
+      static const portal_token_path_provider_t path_provider = []() {
+        return platf::get_xdg_restore_token_path();
+      };
+  #endif
+      return path_provider;
+    }
+#endif
   }  // namespace
 
   /**
@@ -147,6 +183,16 @@ namespace confighttp {
     virtual_input_license_status_provider() = lvh::get_license_status;
   }
 
+  void set_portal_token_path_provider_for_testing(confighttp::portal_token_path_provider_t path_provider) {
+    portal_token_path_provider() = std::move(path_provider);
+  }
+
+  void reset_portal_token_path_provider_for_testing() {
+    portal_token_path_provider() = []() {
+      return platf::get_xdg_restore_token_path();
+    };
+  }
+
   void clear_sensitive_string_for_testing(std::string &value) {
     const scoped_sensitive_string_clear_t clear_value {value};
   }
@@ -174,7 +220,12 @@ namespace confighttp {
    */
   constexpr auto CSRF_TOKEN_LIFETIME = std::chrono::hours(1);  // Tokens valid for 1 hour
 
-  constexpr auto LIBVIRTUALHID_MINIMUM_VERSION = ""sv;  ///< Minimum supported libvirtualhid driver version; empty means any version.
+#ifndef __APPLE__
+  constexpr std::string_view libvirtualhid_minimum_version = LIBVIRTUALHID_MINIMUM_VERSION;  ///< Minimum supported Windows broker version.
+#endif
+#ifdef __APPLE__
+  constexpr std::string_view libvirtualhid_macos_minimum_version = LIBVIRTUALHID_MACOS_MINIMUM_VERSION;  ///< Minimum supported macOS broker bundle version.
+#endif
   constexpr auto VIGEMBUS_MINIMUM_VERSION = "1.17.0.0"sv;  ///< Minimum supported ViGEmBus fallback driver version.  // NOSONAR(cpp:S1313): not an IP address
 
   /**
@@ -230,8 +281,13 @@ namespace confighttp {
     return parts;
   }
 
+  bool is_driver_version_development(std::string_view version) {
+    const auto version_parts = parse_driver_version(version);
+    return version_parts && version_parts->size() >= 3U && (*version_parts)[0] == 0U && (*version_parts)[1] == 0U;
+  }
+
   bool is_driver_version_supported(std::string_view version, std::string_view minimum_version) {
-    if (minimum_version.empty()) {
+    if (minimum_version.empty() || is_driver_version_development(version)) {
       return true;
     }
 
@@ -261,6 +317,7 @@ namespace confighttp {
     output_tree["version"] = version;
     output_tree["minimum_version"] = minimum_version_text;
     output_tree["supported_versions"] = minimum_version.empty() ? "Any" : std::format(">= {}", minimum_version_text);
+    output_tree["development_version"] = installed && is_driver_version_development(version);
     output_tree["version_compatible"] = installed && is_driver_version_supported(version, minimum_version);
 
     return output_tree;
@@ -469,6 +526,42 @@ namespace confighttp {
 
 #endif
 
+#ifdef __APPLE__
+  /**
+   * @brief Read the installed macOS Virtual HID Broker app version.
+   *
+   * @return Three-part bundle version, or empty when the app is unavailable.
+   */
+  std::string read_libvirtualhid_broker_version() {
+    const auto bundle_url = CFURLCreateWithFileSystemPath(
+      kCFAllocatorDefault,
+      CFSTR("/Applications/VirtualHIDBroker.app"),
+      kCFURLPOSIXPathStyle,
+      true
+    );
+    if (!bundle_url) {
+      return {};
+    }
+
+    const auto bundle = CFBundleCreate(kCFAllocatorDefault, bundle_url);
+    CFRelease(bundle_url);
+    if (!bundle) {
+      return {};
+    }
+
+    std::string version;
+    const auto value = CFBundleGetValueForInfoDictionaryKey(bundle, CFSTR("CFBundleShortVersionString"));
+    if (value && CFGetTypeID(value) == CFStringGetTypeID()) {
+      std::array<char, 64> buffer {};
+      if (CFStringGetCString(static_cast<CFStringRef>(value), buffer.data(), buffer.size(), kCFStringEncodingUTF8)) {
+        version = buffer.data();
+      }
+    }
+    CFRelease(bundle);
+    return version;
+  }
+#endif
+
   /**
    * @brief Log the request details.
    * @param request The HTTP request object.
@@ -603,11 +696,11 @@ namespace confighttp {
 
   /**
    * @brief Send a 404 Not Found response.
+   *
    * @param response The HTTP response object.
-   * @param request The HTTP request object.
    * @param error_message The error message to include in the response.
    */
-  void not_found(const resp_https_t &response, [[maybe_unused]] const req_https_t &request, const std::string &error_message) {
+  void not_found(const resp_https_t &response, const std::string &error_message) {
     constexpr auto code = SimpleWeb::StatusCode::client_error_not_found;
 
     nlohmann::json tree;
@@ -624,11 +717,11 @@ namespace confighttp {
 
   /**
    * @brief Send a 400 Bad Request response.
+   *
    * @param response The HTTP response object.
-   * @param request The HTTP request object.
    * @param error_message The error message to include in the response.
    */
-  void bad_request(const resp_https_t &response, [[maybe_unused]] const req_https_t &request, const std::string &error_message) {
+  void bad_request(const resp_https_t &response, const std::string &error_message) {
     constexpr auto code = SimpleWeb::StatusCode::client_error_bad_request;
 
     nlohmann::json tree;
@@ -650,7 +743,7 @@ namespace confighttp {
   bool check_content_type(const resp_https_t &response, const req_https_t &request, const std::string_view &contentType) {
     const auto requestContentType = request->header.find("content-type");
     if (requestContentType == request->header.end()) {
-      bad_request(response, request, "Content type not provided");
+      bad_request(response, "Content type not provided");
       return false;
     }
     // Extract the media type part before any parameters (e.g., charset)
@@ -667,7 +760,7 @@ namespace confighttp {
     boost::algorithm::to_lower(expectedContentType);
 
     if (actualContentType != expectedContentType) {
-      bad_request(response, request, "Content type mismatch");
+      bad_request(response, "Content type mismatch");
       return false;
     }
     return true;
@@ -734,7 +827,7 @@ namespace confighttp {
     if (token_it == csrf_tokens.end()) {
       auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
       BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF token validation failed: no token found for client"sv;
-      bad_request(response, request, "Invalid CSRF token");
+      bad_request(response, "Invalid CSRF token");
       return false;
     }
 
@@ -742,14 +835,14 @@ namespace confighttp {
       csrf_tokens.erase(token_it);
       auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
       BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF token validation failed: token expired"sv;
-      bad_request(response, request, "CSRF token expired");
+      bad_request(response, "CSRF token expired");
       return false;
     }
 
     if (token_it->second.token != provided_token) {
       auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
       BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF token validation failed: token mismatch"sv;
-      bad_request(response, request, "Invalid CSRF token");
+      bad_request(response, "Invalid CSRF token");
       return false;
     }
 
@@ -807,7 +900,7 @@ namespace confighttp {
         auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
         BOOST_LOG(error) << "Web UI: ["sv << address << "] -- CSRF protection blocked request from origin: "sv << blocked_origin;
         BOOST_LOG(error) << "Web UI: To allow this origin, add it to the 'csrf_allowed_origins' option in your Sunshine configuration"sv;
-        bad_request(response, request, "Missing CSRF token");
+        bad_request(response, "Missing CSRF token");
         return false;
       }
 
@@ -821,32 +914,24 @@ namespace confighttp {
   /**
    * @brief Validates the application index and sends an error response if invalid.
    */
-  bool check_app_index(const resp_https_t &response, const req_https_t &request, int index) {
+  bool check_app_index(const resp_https_t &response, int index) {
     std::string file = file_handler::read_file(config::stream.file_apps.c_str());
     nlohmann::json file_tree = nlohmann::json::parse(file);
     if (const auto &apps = file_tree["apps"]; index < 0 || index >= static_cast<int>(apps.size())) {
-      std::string error;
+      std::string error_message;
       if (const int max_index = static_cast<int>(apps.size()) - 1; max_index < 0) {
-        error = "No applications found";
+        error_message = "No applications found";
       } else {
-        error = std::format("'index' {} out of range, max index is {}", index, max_index);
+        error_message = std::format("'index' {} out of range, max index is {}", index, max_index);
       }
-      bad_request(response, request, error);
+      bad_request(response, error_message);
       return false;
     }
     return true;
   }
 
-  /**
-   * @brief Get an HTML page.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
-   * @param html_file The HTML file to serve (relative to WEB_DIR).
-   * @param require_auth Whether to require authentication (default: true).
-   * @param redirect_if_username If true, redirect to "/" when the username is set (for welcome page).
-   */
-  void getPage(const resp_https_t &response, const req_https_t &request, const char *html_file, const bool require_auth, const bool redirect_if_username) {
-    // Special handling for welcome page: redirect if the username is already set or on localhost
+  void getPage(const resp_https_t &response, const req_https_t &request, const bool require_auth, const bool redirect_if_username) {
+    // Special handling for welcome page: redirect if the username is already set
     if (redirect_if_username && (!config::sunshine.username.empty() || net::from_address(net::addr_to_normalized_string(request->remote_endpoint().address())) == net::PC)) {
       send_redirect(response, request, "/");
       return;
@@ -858,7 +943,7 @@ namespace confighttp {
 
     print_req(request);
 
-    const std::string content = file_handler::read_file((get_web_dir() + html_file).c_str());
+    const std::string content = file_handler::read_file((get_web_dir() + "index.html").c_str());
     SimpleWeb::CaseInsensitiveMultimap headers;
     headers.emplace("Content-Type", "text/html; charset=utf-8");
 
@@ -867,6 +952,20 @@ namespace confighttp {
     headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
 
     response->write(content, headers);
+  }
+
+  void getFallbackPage(const resp_https_t &response, const req_https_t &request) {
+    const std::string_view path = request->path;
+    const auto has_server_prefix = [path](const std::string_view prefix) {
+      return path == prefix || (path.starts_with(prefix) && path.length() > prefix.length() && path[prefix.length()] == '/');
+    };
+
+    if (has_server_prefix("/api") || has_server_prefix("/assets") || has_server_prefix("/images")) {
+      not_found(response);
+      return;
+    }
+
+    getPage(response, request);
   }
 
   /**
@@ -932,11 +1031,11 @@ namespace confighttp {
     // Don't do anything if the file does not exist or is outside the assets directory
     if (!isChildPath(filePath, nodeModulesPath)) {
       BOOST_LOG(warning) << "Someone requested a path " << filePath << " that is outside the assets folder";
-      bad_request(response, request);
+      bad_request(response);
       return;
     }
     if (!fs::exists(filePath)) {
-      not_found(response, request);
+      not_found(response);
       return;
     }
 
@@ -946,7 +1045,7 @@ namespace confighttp {
     auto mimeType = mime_types.find(relPath.extension().string().substr(1));
     // check if the extension is in the map at the x position
     if (mimeType == mime_types.end()) {
-      bad_request(response, request);
+      bad_request(response);
       return;
     }
 
@@ -1037,7 +1136,7 @@ namespace confighttp {
       send_response(response, file_tree);
     } catch (std::exception &e) {
       BOOST_LOG(warning) << "GetApps: "sv << e.what();
-      bad_request(response, request, e.what());
+      bad_request(response, e.what());
     }
   }
 
@@ -1137,7 +1236,7 @@ namespace confighttp {
       send_response(response, output_tree);
     } catch (std::exception &e) {
       BOOST_LOG(warning) << "SaveApp: "sv << e.what();
-      bad_request(response, request, e.what());
+      bad_request(response, e.what());
     }
   }
 
@@ -1191,7 +1290,7 @@ namespace confighttp {
       nlohmann::json new_apps = nlohmann::json::array();
       const int index = std::stoi(request->path_match[1]);
 
-      if (!check_app_index(response, request, index)) {
+      if (!check_app_index(response, index)) {
         return;
       }
 
@@ -1214,7 +1313,7 @@ namespace confighttp {
       send_response(response, output_tree);
     } catch (std::exception &e) {
       BOOST_LOG(warning) << "DeleteApp: "sv << e.what();
-      bad_request(response, request, e.what());
+      bad_request(response, e.what());
     }
   }
 
@@ -1291,7 +1390,7 @@ namespace confighttp {
       send_response(response, output_tree);
     } catch (nlohmann::json::exception &e) {
       BOOST_LOG(warning) << "Update Client: "sv << e.what();
-      bad_request(response, request, e.what());
+      bad_request(response, e.what());
     }
   }
 
@@ -1341,7 +1440,7 @@ namespace confighttp {
       send_response(response, output_tree);
     } catch (std::exception &e) {
       BOOST_LOG(warning) << "Unpair: "sv << e.what();
-      bad_request(response, request, e.what());
+      bad_request(response, e.what());
     }
   }
 
@@ -1469,7 +1568,7 @@ namespace confighttp {
       send_response(response, output_tree);
     } catch (std::exception &e) {
       BOOST_LOG(warning) << "SaveConfig: "sv << e.what();
-      bad_request(response, request, e.what());
+      bad_request(response, e.what());
     }
   }
 
@@ -1491,7 +1590,7 @@ namespace confighttp {
 
     try {
       const int index = std::stoi(request->path_match[1]);
-      if (!check_app_index(response, request, index)) {
+      if (!check_app_index(response, index)) {
         return;
       }
 
@@ -1514,7 +1613,7 @@ namespace confighttp {
       // Check if we got the default image path (means validation failed or no image configured)
       if (validated_path == DEFAULT_APP_IMAGE_PATH) {
         BOOST_LOG(debug) << "Application at index " << index << " does not have a valid cover image";
-        not_found(response, request, "Cover image not found");
+        not_found(response, "Cover image not found");
         return;
       }
 
@@ -1522,7 +1621,7 @@ namespace confighttp {
       std::ifstream in(validated_path, std::ios::binary);
       if (!in) {
         BOOST_LOG(warning) << "Unable to read cover image file: " << validated_path;
-        bad_request(response, request, "Unable to read cover image file");
+        bad_request(response, "Unable to read cover image file");
         return;
       }
 
@@ -1534,7 +1633,7 @@ namespace confighttp {
       response->write(SimpleWeb::StatusCode::success_ok, in, headers);
     } catch (std::exception &e) {
       BOOST_LOG(warning) << "GetCover: "sv << e.what();
-      bad_request(response, request, e.what());
+      bad_request(response, e.what());
     }
   }
 
@@ -1568,7 +1667,7 @@ namespace confighttp {
 
       std::string key = input_tree.value("key", "");
       if (key.empty()) {
-        bad_request(response, request, "Cover key is required");
+        bad_request(response, "Cover key is required");
         return;
       }
       std::string url = input_tree.value("url", "");
@@ -1579,11 +1678,11 @@ namespace confighttp {
       std::basic_string path = coverdir + http::url_escape(key) + ".png";
       if (!url.empty()) {
         if (http::url_get_host(url) != "images.igdb.com") {
-          bad_request(response, request, "Only images.igdb.com is allowed");
+          bad_request(response, "Only images.igdb.com is allowed");
           return;
         }
         if (!http::download_file(url, path)) {
-          bad_request(response, request, "Failed to download cover");
+          bad_request(response, "Failed to download cover");
           return;
         }
       } else {
@@ -1597,7 +1696,7 @@ namespace confighttp {
       send_response(response, output_tree);
     } catch (std::exception &e) {
       BOOST_LOG(warning) << "UploadCover: "sv << e.what();
-      bad_request(response, request, e.what());
+      bad_request(response, e.what());
     }
   }
 
@@ -1690,33 +1789,105 @@ namespace confighttp {
 
       if (!errors.empty()) {
         // join the errors array
-        std::string error = std::accumulate(errors.begin(), errors.end(), std::string(), [](const std::string &a, const std::string &b) {
+        std::string error_message = std::accumulate(errors.begin(), errors.end(), std::string(), [](const std::string &a, const std::string &b) {
           return a.empty() ? b : a + ", " + b;
         });
-        bad_request(response, request, error);
+        bad_request(response, error_message);
         return;
       }
 
       send_response(response, output_tree);
     } catch (std::exception &e) {
       BOOST_LOG(warning) << "SavePassword: "sv << e.what();
-      bad_request(response, request, e.what());
+      bad_request(response, e.what());
     }
   }
 
   /**
-   * @brief Send a pin code to the host. The pin is generated from the Moonlight client during the pairing process.
-   * @param response The HTTP response object.
-   * @param request The HTTP request object.
+   * @brief List client pairing requests that are waiting for PIN approval.
+   *
+   * @api_examples{/api/pin| GET| null}
+   */
+  void getPendingPairings(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    print_req(request);
+
+    nlohmann::json output_tree;
+    output_tree["pairings"] = nlohmann::json::array();
+    for (const auto &pairing : nvhttp::get_pending_pairings()) {
+      output_tree["pairings"].push_back({
+        {"id", pairing.id},
+        {"name", pairing.name},
+        {"address", pairing.address},
+      });
+    }
+    send_response(response, output_tree);
+  }
+
+  /**
+   * @brief Cancel a client pairing request that is waiting for PIN approval.
+   * The body for the delete request should be JSON serialized in the following format:
+   * @code{.json}
+   * {
+   *   "pairing_id": "<pairing_id>"
+   * }
+   * @endcode
+   *
+   * @api_examples{/api/pin| DELETE| {"pairing_id":"0123456789abcdef0123456789abcdef"}}
+   */
+  void cancelPairing(const resp_https_t &response, const req_https_t &request) {
+    if (!check_content_type(response, request, "application/json")) {
+      return;
+    }
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    const std::string client_id = get_client_id(request);
+    if (!validate_csrf_token(response, request, client_id)) {
+      return;
+    }
+
+    print_req(request);
+
+    std::stringstream ss;
+    ss << request->content.rdbuf();
+    try {
+      const nlohmann::json input_tree = nlohmann::json::parse(ss);
+      const std::string pairing_id = input_tree.value("pairing_id", "");
+      if (!nvhttp::is_valid_pairing_id(pairing_id)) {
+        bad_request(response, "pairing_id must contain exactly 32 hexadecimal characters");
+        return;
+      }
+
+      nlohmann::json output_tree;
+      output_tree["status"] = nvhttp::cancel_pairing(pairing_id);
+      send_response(response, output_tree);
+    } catch (nlohmann::json::exception &e) {
+      BOOST_LOG(warning) << "CancelPairing: "sv << e.what();
+      bad_request(response, e.what());
+    }
+  }
+
+  /**
+   * @brief Submit a PIN and return whether the selected client completes pairing.
+   *
+   * The request remains open for up to the configured `ping_timeout` while
+   * Moonlight completes the cryptographic handshake. A wrong PIN, protocol
+   * failure, cancellation, or timeout returns `{"status":false}`.
    * The body for the post request should be JSON serialized in the following format:
    * @code{.json}
    * {
+   *   "pairing_id": "<pairing_id>",
    *   "pin": "<pin>",
    *   "name": "Friendly Client Name"
    * }
    * @endcode
    *
-   * @api_examples{/api/pin| POST| {"pin":"1234","name":"My PC"}}
+   * @api_examples{/api/pin| POST| {"pairing_id":"0123456789abcdef0123456789abcdef","pin":"1234","name":"My PC"}}
    */
   void savePin(const resp_https_t &response, const req_https_t &request) {
     if (!check_content_type(response, request, "application/json")) {
@@ -1739,30 +1910,32 @@ namespace confighttp {
       nlohmann::json output_tree;
       nlohmann::json input_tree = nlohmann::json::parse(ss);
       const std::string name = input_tree.value("name", "");
+      const std::string pairing_id = input_tree.value("pairing_id", "");
       const std::string pin = input_tree.value("pin", "");
-
-      int _pin = 0;
-      _pin = std::stoi(pin);
-      if (_pin < 0 || _pin > 9999) {
-        bad_request(response, request, "PIN must be between 0000 and 9999");
+      if (!nvhttp::is_valid_pairing_id(pairing_id)) {
+        bad_request(response, "pairing_id must contain exactly 32 hexadecimal characters");
+        return;
+      }
+      if (!nvhttp::is_valid_pairing_pin(pin)) {
+        bad_request(response, "PIN must contain exactly 4 numeric digits");
+        return;
+      }
+      if (!nvhttp::is_valid_pairing_name(name)) {
+        bad_request(response, "Client name must contain between 1 and 128 bytes");
         return;
       }
 
-      std::string error_code;
-      const bool paired = nvhttp::pin(pin, name, &error_code);
+      const bool paired = nvhttp::pin(pairing_id, pin, name);
       output_tree["status"] = paired;
       output_tree["pairing_complete"] = paired;
-      if (paired) {
-        BOOST_LOG(info) << "Moonlight pairing completed"sv;
-      } else {
-        BOOST_LOG(warning) << "Moonlight pairing did not complete ["sv << error_code << "]"sv;
-        output_tree["error_code"] = error_code;
-        output_tree["error"] = "Pairing did not complete. Keep one Moonlight pairing request open and try its current PIN again.";
+      if (!paired) {
+        output_tree["error_code"] = "pairing_failed";
+        output_tree["error"] = "Pairing did not complete. Request a new PIN in Moonlight and try again.";
       }
       send_response(response, output_tree);
     } catch (std::exception &e) {
       BOOST_LOG(warning) << "SavePin: "sv << e.what();
-      bad_request(response, request, e.what());
+      bad_request(response, e.what());
     }
   }
 
@@ -1791,6 +1964,42 @@ namespace confighttp {
   }
 
   /**
+   * @brief Authenticate a Web UI request and delete the saved XDG Portal restore token.
+   * @details On platforms without XDG Portal capture, this operation succeeds without changing the filesystem.
+   *
+   * @param response HTTP response used for authentication, CSRF, and status output.
+   * @param request HTTP request carrying the client identity and CSRF token.
+   *
+   * @api_examples{/api/reset-portal-token| POST| null}
+   */
+  void resetPortalToken(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    std::string client_id = get_client_id(request);
+    if (!validate_csrf_token(response, request, client_id)) {
+      return;
+    }
+
+    print_req(request);
+
+    bool status = true;
+#if defined(linux) || defined(__FreeBSD__)
+    std::error_code ec;
+    fs::remove(portal_token_path_provider()(), ec);
+    if (ec) {
+      BOOST_LOG(error) << "Failed to delete XDG Portal restore token: "sv << ec.message();
+      status = false;
+    }
+#endif
+
+    nlohmann::json output_tree;
+    output_tree["status"] = status;
+    send_response(response, output_tree);
+  }
+
+  /**
    * @brief Authenticate a Web UI request and restart the Sunshine process.
    *
    * @param response HTTP response used for authentication or CSRF failures.
@@ -1815,14 +2024,97 @@ namespace confighttp {
   }
 
   /**
-   * @brief Build libvirtualhid driver version and installation status.
+   * @brief Return permission status for the current host platform.
    *
-   * @return libvirtualhid driver status JSON.
+   * @api_examples{/api/permissions|:| GET|:| null}
+   */
+  void getPermissions(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    nlohmann::json output_tree;
+    output_tree["permissions"] = nlohmann::json::array();
+#ifdef SUNSHINE_TESTS
+    if (permission_status_override) {
+      output_tree["permissions"] = *permission_status_override;
+      send_response(response, output_tree);
+      return;
+    }
+#endif
+    for (const auto &permission : platf::get_permission_statuses()) {
+      output_tree["permissions"].push_back({
+        {"id", permission.id},
+        {"status", permission.status},
+        {"required", permission.required},
+        {"verifiable", permission.verifiable},
+        {"requestable", permission.requestable},
+      });
+    }
+    send_response(response, output_tree);
+  }
+
+#ifdef SUNSHINE_TESTS
+  void set_permission_statuses_for_testing(nlohmann::json permissions) {
+    permission_status_override = std::move(permissions);
+  }
+
+  void reset_permission_statuses_for_testing() {
+    permission_status_override.reset();
+  }
+#endif
+
+  /**
+   * @brief Start a native permission request or open its settings pane.
+   *
+   * @api_examples{/api/permissions/request|:| POST|:| {"id":"screen_recording"}}
+   */
+  void requestPermission(const resp_https_t &response, const req_https_t &request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+    const auto client_id = get_client_id(request);
+    if (!validate_csrf_token(response, request, client_id)) {
+      return;
+    }
+    if (!check_content_type(response, request, "application/json")) {
+      return;
+    }
+
+    try {
+      const auto input = nlohmann::json::parse(request->content.string());
+      if (!input.is_object() || !input.contains("id") || !input["id"].is_string()) {
+        bad_request(response, "A permission ID is required");
+        return;
+      }
+
+      const bool requested = platf::request_permission(input["id"].get<std::string>());
+      if (!requested) {
+        bad_request(response, "Unknown or unavailable permission");
+        return;
+      }
+      send_response(response, {{"status", true}});
+    } catch (const nlohmann::json::exception &) {
+      bad_request(response, "Invalid permission request");
+    }
+  }
+
+  /**
+   * @brief Build Virtual HID Broker version and installation status.
+   *
+   * @return Virtual HID Broker status JSON.
    */
   nlohmann::json get_virtualhid_driver_status() {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__APPLE__)
+  #ifdef _WIN32
     const auto version_str = read_libvirtualhid_driver_version();
-    auto output_tree = build_driver_status(false, version_str, LIBVIRTUALHID_MINIMUM_VERSION);
+    const auto minimum_version = libvirtualhid_minimum_version;
+  #else
+    const auto version_str = read_libvirtualhid_broker_version();
+    const auto minimum_version = libvirtualhid_macos_minimum_version;
+  #endif
+    const auto driver_detected = !version_str.empty();
+    auto output_tree = build_driver_status(driver_detected, version_str, minimum_version);
     bool requires_installed_driver = true;
     std::string backend_name;
     std::string runtime_error_message;
@@ -1833,7 +2125,7 @@ namespace confighttp {
         const auto &capabilities = runtime->capabilities();
         backend_name = capabilities.backend_name;
         requires_installed_driver = capabilities.requires_installed_driver;
-        output_tree = build_driver_status(capabilities.supports_gamepad, version_str, LIBVIRTUALHID_MINIMUM_VERSION);
+        output_tree = build_driver_status(driver_detected || capabilities.supports_gamepad, version_str, minimum_version);
       }
     } catch (const std::bad_alloc &exception) {
       runtime_error_message = exception.what();
@@ -1845,8 +2137,8 @@ namespace confighttp {
       output_tree["error"] = runtime_error_message;
     }
 #else
-    auto output_tree = build_driver_status(false, "", LIBVIRTUALHID_MINIMUM_VERSION);
-    output_tree["error"] = "libvirtualhid driver status is only available on Windows";
+    auto output_tree = build_driver_status(false, "", libvirtualhid_minimum_version);
+    output_tree["error"] = "Virtual HID Broker status is only available on Windows and macOS";
     output_tree["backend_name"] = "";
     output_tree["requires_installed_driver"] = false;
 #endif
@@ -1949,7 +2241,7 @@ namespace confighttp {
         auto license_key = input_tree.value("license_key", "");
         input_tree["license_key"] = "";
         if (license_key.empty()) {
-          bad_request(response, request, "License key is required");
+          bad_request(response, "License key is required");
           return;
         }
 
@@ -1960,16 +2252,24 @@ namespace confighttp {
       } else if (action == "deactivate") {
         result = lvh::deactivate_license();
       } else {
-        bad_request(response, request, "Unknown license action");
+        bad_request(response, "Unknown license action");
         return;
       }
 
-#if defined(_WIN32) && defined(SUNSHINE_TRAY) && SUNSHINE_TRAY >= 1
+#ifdef _WIN32
+      config::select_all_gamepad_drivers_if_licensed(result.license.licensed());
+#endif
+#if (defined(_WIN32) || defined(__APPLE__)) && defined(SUNSHINE_TRAY) && SUNSHINE_TRAY >= 1
       system_tray::update_tray_virtualhid_license(result.license, false);
+#endif
+#ifdef _WIN32
+      if (result.status.ok()) {
+        input::refresh_virtual_input();
+      }
 #endif
       send_response(response, build_virtualhid_license_status(result));
     } catch (const nlohmann::json::exception &) {
-      bad_request(response, request, "Invalid license request");
+      bad_request(response, "Invalid license request");
     }
   }
 
@@ -2137,7 +2437,7 @@ namespace confighttp {
       }
 
       if (!fs::is_directory(dir_path, ec)) {
-        bad_request(response, request, "Path is not a directory");
+        bad_request(response, "Path is not a directory");
         return;
       }
 
@@ -2156,7 +2456,7 @@ namespace confighttp {
       send_response(response, output_tree);
     } catch (const fs::filesystem_error &e) {
       BOOST_LOG(warning) << "BrowseDirectory: "sv << e.what();
-      bad_request(response, request, e.what());
+      bad_request(response, e.what());
     }
   }
 
@@ -2172,39 +2472,27 @@ namespace confighttp {
 
     https_server_t server {config::nvhttp.cert, config::nvhttp.pkey};
 
-    // Helper to create page handler lambdas without repeating the signature
-    auto page_handler = [](const char *file, bool require_auth = true, bool redirect_if_username = false) {
-      return [file, require_auth, redirect_if_username](const resp_https_t &response, const req_https_t &request) {
-        getPage(response, request, file, require_auth, redirect_if_username);
+    // Helper to create SPA entry handlers without repeating the signature
+    auto page_handler = [](bool require_auth = true, bool redirect_if_username = false) {
+      return [require_auth, redirect_if_username](const resp_https_t &response, const req_https_t &request) {
+        getPage(response, request, require_auth, redirect_if_username);
       };
     };
 
-    // Default resource handlers
-    const https_handler_t bad_request_handler = [](const resp_https_t &response, const req_https_t &request) {
-      bad_request(response, request);
+    // Unsupported methods use the common HTTP handler signature and do not inspect the request.
+    const https_handler_t bad_request_handler = [](const resp_https_t &response, const req_https_t &) {
+      bad_request(response);
     };
-    const https_handler_t not_found_handler = [](const resp_https_t &response, const req_https_t &request) {
-      not_found(response, request);
-    };
-
     // error by default
     server.default_resource["DELETE"] = bad_request_handler;
     server.default_resource["PATCH"] = bad_request_handler;
     server.default_resource["POST"] = bad_request_handler;
     server.default_resource["PUT"] = bad_request_handler;
-    server.default_resource["GET"] = not_found_handler;
+    server.default_resource["GET"] = getFallbackPage;
 
-    // web pages
-    server.resource["^/$"]["GET"] = page_handler("index.html");
-    server.resource["^/apps/?$"]["GET"] = page_handler("apps.html");
-    server.resource["^/clients/?$"]["GET"] = page_handler("clients.html");
-    server.resource["^/config/?$"]["GET"] = page_handler("config.html");
-    server.resource["^/featured/?$"]["GET"] = page_handler("featured.html");
-    server.resource["^/logout/?$"]["GET"] = page_handler("logout.html", false);
-    server.resource["^/password/?$"]["GET"] = page_handler("password.html");
-    server.resource["^/pin/?$"]["GET"] = page_handler("pin.html");
-    server.resource["^/troubleshooting/?$"]["GET"] = page_handler("troubleshooting.html");
-    server.resource["^/welcome/?$"]["GET"] = page_handler("welcome.html", false, true);
+    // Public SPA routes with authentication behavior that differs from the default fallback
+    server.resource["^/logout/?$"]["GET"] = page_handler(false);
+    server.resource["^/welcome/?$"]["GET"] = page_handler(false, true);
 
     // rest api
     server.resource["^/api/browse$"]["GET"] = browseDirectory;
@@ -2223,10 +2511,15 @@ namespace confighttp {
     server.resource["^/api/covers/upload$"]["POST"] = uploadCover;
     server.resource["^/api/csrf-token$"]["GET"] = getCSRFToken;
     server.resource["^/api/password$"]["POST"] = savePassword;
+    server.resource["^/api/pin$"]["DELETE"] = cancelPairing;
+    server.resource["^/api/pin$"]["GET"] = getPendingPairings;
     server.resource["^/api/pin$"]["POST"] = savePin;
     server.resource["^/api/logs$"]["GET"] = getLogs;
     server.resource["^/api/reset-display-device-persistence$"]["POST"] = resetDisplayDevicePersistence;
+    server.resource["^/api/reset-portal-token$"]["POST"] = resetPortalToken;
     server.resource["^/api/restart$"]["POST"] = restart;
+    server.resource["^/api/permissions$"]["GET"] = getPermissions;
+    server.resource["^/api/permissions/request$"]["POST"] = requestPermission;
     server.resource["^/api/virtual-input/license$"]["GET"] = getVirtualInputLicense;
     server.resource["^/api/virtual-input/license$"]["POST"] = updateVirtualInputLicense;
     server.resource["^/api/virtual-input/status$"]["GET"] = getVirtualInputStatus;
@@ -2240,14 +2533,12 @@ namespace confighttp {
     server.config.address = net::get_bind_address(address_family);
     server.config.port = port_https;
 
-    // Store bind address for logging, use "localhost" as fallback for wildcard addresses
-    const auto bind_addr = server.config.address;
-    const auto display_addr = config::sunshine.bind_address.empty() ? "localhost"sv : std::string_view {bind_addr};
+    const auto display_addr = net::get_bind_address_url_host();
 
-    auto accept_and_run = [&](auto *server) {
+    auto accept_and_run = [&](auto *https_server) {
       try {
         platf::set_thread_name("confighttp::tcp");
-        server->start([&display_addr](const unsigned short port) {
+        https_server->start([&display_addr](const unsigned short port) {
           BOOST_LOG(info) << "Configuration UI available at [https://"sv << display_addr << ":" << port << "]";
         });
       } catch (boost::system::system_error &err) {

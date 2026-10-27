@@ -13,16 +13,14 @@ namespace crypto {
   /**
    * @brief OpenSSL ASN.1 string pointer with automatic release.
    */
-  using asn1_string_t = util::safe_ptr<ASN1_STRING, ASN1_STRING_free>;
+  using asn1_string_t = util::safe_ptr<ASN1_STRING, &ASN1_STRING_free>;
   /**
    * @brief OpenSSL X.509 subject/issuer name pointer with automatic release.
    */
   using x509_name_t = util::safe_ptr<X509_NAME, &X509_NAME_free>;
+  constexpr char UNPAIRED_CERTIFICATE_ERROR[] = "Client certificate identity is not paired";  ///< Error returned when no exact stored certificate matches.
 
-  cert_chain_t::cert_chain_t():
-      _certs {},
-      _cert_ctx {X509_STORE_CTX_new()} {
-  }
+  cert_chain_t::cert_chain_t() = default;
 
   void cert_chain_t::add(x509_t &&cert) {
     x509_store_t x509_store {X509_STORE_new()};
@@ -51,19 +49,9 @@ namespace crypto {
     }
   }
 
-  /**
-   * @brief Verify the certificate chain.
-   * When certificates from two or more instances of Moonlight have been added to x509_store_t,
-   * only one of them will be verified by X509_verify_cert, resulting in only a single instance of
-   * Moonlight to be able to use Sunshine
-   *
-   * To circumvent this, x509_store_t instance will be created for each instance of the certificates.
-   * @param cert The certificate to verify.
-   * @return nullptr if the certificate is valid, otherwise an error string.
-   */
   const char *cert_chain_t::verify(x509_t::element_type *cert) {
     int err_code = 0;
-    for (auto &[_, x509_store] : _certs) {
+    for (auto &[trusted_cert, x509_store] : _certs) {
       auto fg = util::fail_guard([this]() {
         X509_STORE_CTX_cleanup(_cert_ctx.get());
       });
@@ -76,10 +64,13 @@ namespace crypto {
       // that OpenSSL doesn't detect as self-signed due to some X509v3 extensions.
       X509_STORE_CTX_set_flags(_cert_ctx.get(), X509_V_FLAG_PARTIAL_CHAIN);
 
-      auto err = X509_verify_cert(_cert_ctx.get());
+      if (auto err = X509_verify_cert(_cert_ctx.get()); err == 1) {
+        if (X509_cmp(trusted_cert.get(), cert) == 0) {
+          return nullptr;
+        }
 
-      if (err == 1) {
-        return nullptr;
+        err_code = X509_V_ERR_CERT_REJECTED;
+        continue;
       }
 
       err_code = X509_STORE_CTX_get_error(_cert_ctx.get());
@@ -89,7 +80,7 @@ namespace crypto {
       }
     }
 
-    return X509_verify_cert_error_string(err_code);
+    return err_code == 0 ? UNPAIRED_CERTIFICATE_ERROR : X509_verify_cert_error_string(err_code);
   }
 
   namespace cipher {
@@ -314,16 +305,16 @@ namespace crypto {
       return update_outlen + final_outlen;
     }
 
-    ecb_t::ecb_t(const aes_t &key, bool padding):
-        cipher_t {EVP_CIPHER_CTX_new(), EVP_CIPHER_CTX_new(), key, padding} {
+    ecb_t::ecb_t(const aes_t &key_material, bool use_padding):
+        cipher_t {cipher_ctx_t {EVP_CIPHER_CTX_new()}, cipher_ctx_t {EVP_CIPHER_CTX_new()}, key_material, use_padding} {
     }
 
-    cbc_t::cbc_t(const aes_t &key, bool padding):
-        cipher_t {nullptr, nullptr, key, padding} {
+    cbc_t::cbc_t(const aes_t &key_material, bool use_padding):
+        cipher_t {nullptr, nullptr, key_material, use_padding} {
     }
 
-    gcm_t::gcm_t(const crypto::aes_t &key, bool padding):
-        cipher_t {nullptr, nullptr, key, padding} {
+    gcm_t::gcm_t(const crypto::aes_t &key_material, bool use_padding):
+        cipher_t {nullptr, nullptr, key_material, use_padding} {
     }
 
   }  // namespace cipher
@@ -411,8 +402,6 @@ namespace crypto {
    * @brief Return the certificate signature bytes.
    */
   std::string_view signature(const x509_t &x) {
-    // X509_ALGOR *_ = nullptr;
-
     const ASN1_BIT_STRING *asn1 = nullptr;
     X509_get0_signature(&asn1, nullptr, x.get());
 

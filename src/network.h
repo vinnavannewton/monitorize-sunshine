@@ -37,7 +37,7 @@ namespace net {
   /**
    * @brief Owning ENet host pointer released with `enet_host_destroy`.
    */
-  using host_t = util::safe_ptr<ENetHost, free_host>;
+  using host_t = util::safe_ptr<ENetHost, &free_host>;
   /**
    * @brief Raw ENet peer handle owned by an ENet host.
    */
@@ -45,7 +45,7 @@ namespace net {
   /**
    * @brief Owning ENet packet pointer released with `enet_packet_destroy`.
    */
-  using packet_t = util::safe_ptr<ENetPacket, enet_packet_destroy>;
+  using packet_t = util::safe_ptr<ENetPacket, &enet_packet_destroy>;
 
   /**
    * @brief Enumerates supported net options.
@@ -105,6 +105,14 @@ namespace net {
   af_e af_from_enum_string(const std::string_view &view);
 
   /**
+   * @brief Get the effective address family for listening sockets.
+   * @details An IPv4 bind address narrows dual-stack mode to IPv4 so the socket protocol matches the bind endpoint.
+   * @param af Configured address family.
+   * @return IPv4 for a valid IPv4 bind address in dual-stack mode, or `af` otherwise.
+   */
+  af_e get_effective_address_family(af_e af);
+
+  /**
    * @brief Get the wildcard binding address for a given address family.
    * @param af Address family.
    * @return Normalized address.
@@ -117,6 +125,13 @@ namespace net {
    * @return The configured bind address or wildcard if not configured.
    */
   std::string get_bind_address(af_e af);
+
+  /**
+   * @brief Get the configured bind address formatted as a URL host.
+   * @details IPv6 addresses are enclosed in brackets. An empty bind address is represented as `localhost`.
+   * @return URL host for links to services bound by Sunshine.
+   */
+  std::string get_bind_address_url_host();
 
   /**
    * @brief Convert an address to a normalized form.

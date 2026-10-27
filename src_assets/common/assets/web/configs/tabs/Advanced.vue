@@ -2,11 +2,11 @@
 import { ref } from 'vue'
 import PlatformLayout from '../../PlatformLayout.vue'
 
-const props = defineProps([
-  'platform',
-  'config',
-  'global_prep_cmd'
-])
+const props = defineProps({
+  platform: String,
+  config: Object,
+  global_prep_cmd: Array,
+})
 
 const config = ref(props.config)
 </script>
@@ -16,7 +16,7 @@ const config = ref(props.config)
     <!-- FEC Percentage -->
     <div class="mb-3">
       <label for="fec_percentage" class="form-label">{{ $t('config.fec_percentage') }}</label>
-      <input type="text" class="form-control" id="fec_percentage" placeholder="20" v-model="config.fec_percentage" />
+      <input type="number" class="form-control" id="fec_percentage" placeholder="20" min="0" max="100" v-model="config.fec_percentage" />
       <div class="form-text">{{ $t('config.fec_percentage_desc') }}</div>
     </div>
 
@@ -117,7 +117,3 @@ const config = ref(props.config)
 
   </div>
 </template>
-
-<style scoped>
-
-</style>

@@ -26,12 +26,16 @@ extern "C" {
 
 using namespace std::literals;
 
-void launch_ui(const std::optional<std::string> &path) {
-  std::string url = std::format("https://localhost:{}", static_cast<int>(net::map_port(confighttp::PORT_HTTPS)));
+std::string get_launch_ui_url(const std::optional<std::string> &path) {
+  std::string url = std::format("https://{}:{}", net::get_bind_address_url_host(), static_cast<int>(net::map_port(confighttp::PORT_HTTPS)));
   if (path) {
     url += *path;
   }
-  platf::open_url(url);
+  return url;
+}
+
+void launch_ui(const std::optional<std::string> &path) {
+  platf::open_url(get_launch_ui_url(path));
 }
 
 namespace args {
@@ -127,11 +131,11 @@ namespace service_ctrl {
   class service_controller {
   public:
     /**
-     * @brief Open the Windows service manager and Sunshine service handle.
+     * @brief Explicitly open the Windows service manager and Sunshine service handle.
      *
      * @param service_desired_access SERVICE_* desired access flags.
      */
-    service_controller(DWORD service_desired_access) {
+    explicit service_controller(DWORD service_desired_access) {
       scm_handle = OpenSCManagerA(nullptr, nullptr, SC_MANAGER_CONNECT);
       if (!scm_handle) {
         auto winerr = GetLastError();
@@ -267,8 +271,8 @@ namespace service_ctrl {
       }
 
       uint16_t port_nbo = htons(net::map_port(confighttp::PORT_HTTPS));
-      for (DWORD i = 0; i < tcp_table->dwNumEntries; i++) {
-        auto &entry = tcp_table->table[i];
+      for (DWORD entry_index = 0; entry_index < tcp_table->dwNumEntries; entry_index++) {
+        auto &entry = tcp_table->table[entry_index];
 
         // Look for our port in the listening state
         if (entry.dwLocalPort == port_nbo && entry.dwState == MIB_TCP_STATE_LISTEN) {

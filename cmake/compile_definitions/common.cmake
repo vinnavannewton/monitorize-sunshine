@@ -7,6 +7,8 @@ list(APPEND SUNSHINE_COMPILE_OPTIONS -Wall -Wno-sign-compare)
 # Wno-maybe-uninitialized/Wno-uninitialized - disable warnings for maybe uninitialized variables
 # Wno-sign-compare - disable warnings for signed/unsigned comparisons
 # Wno-restrict - disable warnings for memory overlap
+# Wmissing-field-initializers - enable warnings for missing field initializers
+# Wno-missing-designated-field-initializers - disable warning for missing designated initializers
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     # GCC specific compile options
 
@@ -30,6 +32,12 @@ elseif(CMAKE_CXX_COMPILER_ID MATCHES "^(Apple)?Clang$")
 
     # Clang doesn't actually complain about this this, so disabling for now
     # list(APPEND SUNSHINE_COMPILE_OPTIONS -Wno-uninitialized)
+
+    # Warn for missing positional field initializers but not designated initializers
+    if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 19)
+        list(APPEND SUNSHINE_COMPILE_OPTIONS -Wmissing-field-initializers)
+        list(APPEND SUNSHINE_COMPILE_OPTIONS -Wno-missing-designated-field-initializers)
+    endif()
 
     # Some libc++ versions on Apple and FreeBSD guard std::jthread behind this flag.
     if(APPLE OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
@@ -170,6 +178,8 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/audio.cpp"
         "${CMAKE_SOURCE_DIR}/src/audio.h"
         "${CMAKE_SOURCE_DIR}/src/platform/common.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/permissions.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/permissions.h"
         "${CMAKE_SOURCE_DIR}/src/process.cpp"
         "${CMAKE_SOURCE_DIR}/src/process.h"
         "${CMAKE_SOURCE_DIR}/src/network.cpp"

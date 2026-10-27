@@ -162,11 +162,11 @@ namespace safe {
     }
 
     /**
-     * @brief Inspect the next queued value without popping it.
+     * @brief Inspect whether this event has a value without modifying or consuming it.
      *
      * @return True when a value is available to inspect.
      */
-    bool peek() {
+    bool peek() const {
       return _continue && (bool) _status;
     }
 
@@ -396,34 +396,49 @@ namespace safe {
     using status_t = util::optional_t<T>;
 
     /**
+     * @brief Behavior when raise() is called with the queue already at its bound.
+     */
+    enum class overflow_policy_e {
+      drop_oldest,  ///< Clear the queue and accept the new item (current default behavior)
+      reject  ///< Refuse the new item, leaving existing queued items intact
+    };
+
+    /**
      * @brief Construct a bounded blocking queue.
      *
-     * @param max_elements Maximum number of queued elements before producers block.
+     * @param max_elements Maximum number of elements that may be queued.
+     * @param overflow Behavior when the queue reaches its maximum size.
      */
-    queue_t(std::uint32_t max_elements = 32):
-        _max_elements {max_elements} {
+    explicit queue_t(std::uint32_t max_elements = 32, overflow_policy_e overflow = overflow_policy_e::drop_oldest):
+        _max_elements {max_elements},
+        _overflow_policy {overflow} {
     }
 
     /**
-     * @brief Notify waiters that a new event value is available.
+     * @brief Notify waiters that a new event value may be available.
      *
      * @param args Arguments forwarded to the callable or parser.
+     * @return True if the item was queued, false if the queue is stopped or the
+     *         configured overflow policy rejects the item.
      */
     template<class... Args>
-    void raise(Args &&...args) {
+    bool raise(Args &&...args) {
       std::lock_guard ul {_lock};
 
       if (!_continue) {
-        return;
+        return false;
       }
 
-      if (_queue.size() == _max_elements) {
+      if (_queue.size() >= _max_elements) {
+        if (_overflow_policy == overflow_policy_e::reject) {
+          return false;
+        }
         _queue.clear();
       }
 
       _queue.emplace_back(std::forward<Args>(args)...);
-
       _cv.notify_all();
+      return true;
     }
 
     /**
@@ -524,6 +539,7 @@ namespace safe {
     std::condition_variable _cv;
 
     std::vector<T> _queue;
+    overflow_policy_e _overflow_policy;
   };
 
   /**
@@ -629,9 +645,9 @@ namespace safe {
       }
 
       /**
-       * @brief Check whether this shared pointer wrapper owns a live object.
+       * @brief Explicitly check whether this shared pointer wrapper owns a live object.
        */
-      operator bool() const {
+      explicit operator bool() const {
         return owner != nullptr;
       }
 
@@ -750,13 +766,13 @@ namespace safe {
   class post_t: public T {
   public:
     /**
-     * @brief Construct a message-posting wrapper around an existing type.
+     * @brief Explicitly construct a message-posting wrapper around an existing type.
      *
      * @param mail Mailbox used to exchange messages with worker threads.
      * @param args Arguments forwarded to the wrapped type constructor.
      */
     template<class... Args>
-    post_t(mail_t mail, Args &&...args):
+    explicit post_t(mail_t mail, Args &&...args):
         T(std::forward<Args>(args)...),
         mail {std::move(mail)} {
     }
@@ -797,7 +813,7 @@ namespace safe {
     using queue_t = std::shared_ptr<post_t<queue_t<T>>>;
 
     /**
-     * @brief Create a typed event channel from the raw mailbox.
+     * @brief Create a typed event channel or reuse the live channel with the same identifier.
      *
      * @param id Identifier for the controller, session, display, or resource.
      * @return Typed event channel associated with the supplied identifier.
@@ -806,19 +822,18 @@ namespace safe {
     event_t<T> event(const std::string_view &id) {
       std::lock_guard lg {mutex};
 
-      auto it = id_to_post.find(id);
-      if (it != std::end(id_to_post)) {
+      if (auto it = id_to_post.find(id); it != std::end(id_to_post)) {
         return lock<event_t<T>>(it->second);
       }
 
       auto post = std::make_shared<typename event_t<T>::element_type>(shared_from_this());
-      id_to_post.emplace(std::pair<std::string, std::weak_ptr<void>> {std::string {id}, post});
+      id_to_post.try_emplace(std::string {id}, post);
 
       return post;
     }
 
     /**
-     * @brief Create a typed queue channel from the raw mailbox.
+     * @brief Create a typed queue channel or reuse the live channel with the same identifier.
      *
      * @param id Identifier for the controller, session, display, or resource.
      * @return Typed queue channel associated with the supplied identifier.
@@ -827,13 +842,12 @@ namespace safe {
     queue_t<T> queue(const std::string_view &id) {
       std::lock_guard lg {mutex};
 
-      auto it = id_to_post.find(id);
-      if (it != std::end(id_to_post)) {
+      if (auto it = id_to_post.find(id); it != std::end(id_to_post)) {
         return lock<queue_t<T>>(it->second);
       }
 
       auto post = std::make_shared<typename queue_t<T>::element_type>(shared_from_this(), 32);
-      id_to_post.emplace(std::pair<std::string, std::weak_ptr<void>> {std::string {id}, post});
+      id_to_post.try_emplace(std::string {id}, post);
 
       return post;
     }
@@ -845,7 +859,7 @@ namespace safe {
       std::lock_guard lg {mutex};
 
       for (auto it = std::begin(id_to_post); it != std::end(id_to_post); ++it) {
-        auto &weak = it->second;
+        const auto &weak = it->second;
 
         if (weak.expired()) {
           id_to_post.erase(it);

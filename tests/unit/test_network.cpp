@@ -2,9 +2,35 @@
  * @file tests/unit/test_network.cpp
  * @brief Test src/network.*
  */
+
+// test includes
 #include "../tests_common.h"
 
+// local includes
 #include <src/network.h>
+
+TEST(NetworkClassificationTest, DeducedNetworkListsPreserveAddressScopes) {
+  EXPECT_EQ(net::from_address("127.0.0.1"), net::PC);
+  EXPECT_EQ(net::from_address("192.168.1.2"), net::LAN);
+  EXPECT_EQ(net::from_address("100.64.0.1"), net::LAN);
+  EXPECT_EQ(net::from_address("169.254.1.2"), net::LAN);
+  EXPECT_EQ(net::from_address("8.8.8.8"), net::WAN);
+  EXPECT_EQ(net::from_address("::1"), net::PC);
+  EXPECT_EQ(net::from_address("fc00::1"), net::LAN);
+  EXPECT_EQ(net::from_address("fe80::1"), net::LAN);
+  EXPECT_EQ(net::from_address("2001:4860:4860::8888"), net::WAN);
+}
+
+/**
+ * @brief Loopback and documentation addresses retain their classification when mapped to IPv6.
+ */
+TEST(NetworkClassificationTest, ClassifiesMappedIpv4AddressesWithoutChangingSubsequentLookups) {
+  for (const auto *address : {"127.0.0.1", "192.0.2.1", "198.51.100.2", "203.0.113.3"}) {
+    const auto expected = net::from_address(address);
+    EXPECT_EQ(net::from_address(std::string {"::ffff:"} + address), expected);
+    EXPECT_EQ(net::from_address(address), expected);
+  }
+}
 
 struct MdnsInstanceNameTest: BaseTest, testing::WithParamInterface<std::tuple<std::string, std::string>> {};
 
@@ -67,6 +93,63 @@ TEST_F(BindAddressTest, DefaultBehaviorIPv6) {
 
   const auto bind_addr = net::get_bind_address(net::af_e::BOTH);
   ASSERT_EQ(bind_addr, "::");
+}
+
+/**
+ * @brief Test that an empty bind address preserves the configured address family.
+ */
+TEST_F(BindAddressTest, EmptyAddressPreservesConfiguredFamily) {
+  config::sunshine.bind_address = "";
+
+  EXPECT_EQ(net::get_effective_address_family(net::af_e::IPV4), net::af_e::IPV4);
+  EXPECT_EQ(net::get_effective_address_family(net::af_e::BOTH), net::af_e::BOTH);
+}
+
+/**
+ * @brief Test that an explicit IPv4 bind address selects an IPv4 socket.
+ */
+TEST_F(BindAddressTest, IPv4AddressSelectsIPv4Family) {
+  config::sunshine.bind_address = "192.0.2.101";
+
+  EXPECT_EQ(net::get_effective_address_family(net::af_e::IPV4), net::af_e::IPV4);
+  EXPECT_EQ(net::get_effective_address_family(net::af_e::BOTH), net::af_e::IPV4);
+}
+
+/**
+ * @brief Test that an explicit IPv6 bind address does not override the configured family.
+ */
+TEST_F(BindAddressTest, IPv6AddressPreservesConfiguredFamily) {
+  config::sunshine.bind_address = "2001:db8::1";
+
+  EXPECT_EQ(net::get_effective_address_family(net::af_e::IPV4), net::af_e::IPV4);
+  EXPECT_EQ(net::get_effective_address_family(net::af_e::BOTH), net::af_e::BOTH);
+}
+
+/**
+ * @brief Test that invalid bind addresses preserve the configured family for downstream error reporting.
+ */
+TEST_F(BindAddressTest, InvalidAddressPreservesConfiguredFamily) {
+  config::sunshine.bind_address = "not-an-address";
+
+  EXPECT_EQ(net::get_effective_address_family(net::af_e::IPV4), net::af_e::IPV4);
+  EXPECT_EQ(net::get_effective_address_family(net::af_e::BOTH), net::af_e::BOTH);
+}
+
+/**
+ * @brief Test that bind addresses are formatted for use as URL hosts.
+ */
+TEST_F(BindAddressTest, AddressFormatsAsUrlHost) {
+  config::sunshine.bind_address = "";
+  EXPECT_EQ(net::get_bind_address_url_host(), "localhost");
+
+  config::sunshine.bind_address = "198.51.100.56";
+  EXPECT_EQ(net::get_bind_address_url_host(), "198.51.100.56");
+
+  config::sunshine.bind_address = "2001:db8::1";
+  EXPECT_EQ(net::get_bind_address_url_host(), "[2001:db8::1]");
+
+  config::sunshine.bind_address = "not-an-address";
+  EXPECT_EQ(net::get_bind_address_url_host(), "not-an-address");
 }
 
 /**

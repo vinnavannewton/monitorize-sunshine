@@ -92,7 +92,10 @@ namespace NVENC_NAMESPACE {
       }
     }
 
-    return device != nullptr;
+    return std::visit([](auto *native_device) {
+      return native_device != nullptr;
+    },
+                      device);
   }
 
   bool nvenc_d3d11_on_cuda::create_and_register_input_buffer() {
@@ -144,7 +147,7 @@ namespace NVENC_NAMESPACE {
     }
 
     if (!registered_input_buffer) {
-      NV_ENC_REGISTER_RESOURCE register_resource = {NV_ENC_REGISTER_RESOURCE_VER};
+      NV_ENC_REGISTER_RESOURCE register_resource = {.version = NV_ENC_REGISTER_RESOURCE_VER};
       register_resource.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR;
       register_resource.width = encoder_params.width;
       register_resource.height = encoder_params.height;
@@ -175,7 +178,7 @@ namespace NVENC_NAMESPACE {
       return false;
     }
 
-    auto unmap = [&]() -> bool {
+    auto unmap = [&]() {
       if (cuda_failed(cuda_functions.cuGraphicsUnmapResources(1, &cuda_d3d_input_texture, 0))) {
         BOOST_LOG(error) << "NvEnc: cuGraphicsUnmapResources() failed: error " << last_cuda_error;
         return false;

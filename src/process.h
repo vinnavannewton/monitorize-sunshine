@@ -16,13 +16,11 @@
 #include <optional>
 #include <unordered_map>
 
-// lib includes
-#include <boost/process/v1.hpp>
-
 // local includes
 #include "config.h"
 #include "platform/common.h"
 #include "rtsp.h"
+#include "src/boost_process_compat.h"
 #include "utility.h"
 
 /**
@@ -35,12 +33,12 @@ namespace proc {
   /**
    * @brief Boost.Process pipe stream used for child-process I/O.
    */
-  using file_t = util::safe_ptr_v2<FILE, int, fclose>;
+  using file_t = util::safe_ptr_v2<FILE, int, &fclose>;
 
   /**
    * @brief Parsed command arguments used when launching a child process.
    */
-  typedef config::prep_cmd_t cmd_t;
+  using cmd_t = config::prep_cmd_t;
 
   /**
    * pre_cmds -- guaranteed to be executed unless any of the commands fail.
@@ -210,11 +208,11 @@ namespace proc {
 
   /**
    * @brief Terminates all child processes in a process group.
-   * @param proc The child process itself.
+   * @param child_process The child process itself.
    * @param group The group of all children in the process tree.
    * @param exit_timeout The timeout to wait for the process group to gracefully exit.
    */
-  void terminate_process_group(boost::process::v1::child &proc, boost::process::v1::group &group, std::chrono::seconds exit_timeout);
+  void terminate_process_group(boost::process::v1::child &child_process, boost::process::v1::group &group, std::chrono::seconds exit_timeout);
 
   extern proc_t proc;
 }  // namespace proc

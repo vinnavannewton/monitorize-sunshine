@@ -1,16 +1,78 @@
-<!DOCTYPE html>
-<html lang="en" data-bs-theme="auto">
-
-<head>
-      <%- header %>
-</head>
-
-<body id="app" v-cloak>
+<template>
   <Navbar></Navbar>
   <div id="content" class="container">
     <h1 class="my-4">{{ $t('troubleshooting.troubleshooting') }}</h1>
-    <!-- Virtual gamepad and Virtual HID Driver license -->
-    <div class="card my-4 virtual-gamepad-card" v-if="platform === 'windows'">
+    <div class="card my-4" v-if="permissions.length || permissionError">
+      <div class="card-body">
+        <div class="d-flex align-items-center justify-content-between gap-3 flex-wrap mb-2">
+          <h2 id="permissions" class="mb-0">{{ $t('troubleshooting.permissions_title') }}</h2>
+          <button class="btn btn-outline-secondary" type="button" @click="refreshPermissions">
+            <refresh-cw :size="17" class="icon"></refresh-cw>
+            {{ $t('troubleshooting.permissions_refresh') }}
+          </button>
+        </div>
+        <p>{{ $t('troubleshooting.permissions_desc') }}</p>
+        <div v-if="permissionError" class="alert alert-danger" role="alert">{{ permissionError }}</div>
+        <div v-if="permissions.length" class="table-responsive permission-table-shell">
+          <table class="table align-middle mb-0">
+            <thead>
+              <tr>
+                <th scope="col">{{ $t('troubleshooting.permissions_name') }}</th>
+                <th scope="col">{{ $t('troubleshooting.permissions_status') }}</th>
+                <th scope="col">{{ $t('troubleshooting.permissions_requirement') }}</th>
+                <th scope="col" class="permission-action-column">
+                  <span class="visually-hidden">{{ $t('troubleshooting.permissions_action') }}</span>
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="permission in orderedPermissions" :key="permission.id">
+                <th scope="row">
+                  <strong>{{ $t('troubleshooting.permission_' + permission.id +
+                    (permission.id === 'input' && (platform === 'linux' || platform === 'freebsd') ? '_unix' : '')) }}</strong>
+                  <p class="permission-detail mb-0">{{ $t('troubleshooting.permission_' + permission.id + '_desc' +
+                    (permission.id === 'input' && (platform === 'linux' || platform === 'freebsd') ? '_unix' : '')) }}</p>
+                  <output v-if="permissionHelp === permission.id" class="permission-help d-block mb-0">
+                    {{ $t('troubleshooting.permission_' + permission.id + '_help' +
+                      (permission.id === 'input' && platform !== 'macos' ? '_' + platform : '')) }}
+                  </output>
+                </th>
+                <td>
+                  <span class="status-icon" :class="permissionStatusClass(permission.status)"
+                        :title="$t('troubleshooting.permissions_status_' + permission.status)">
+                    <check-circle v-if="permission.status === 'granted'" :size="20" aria-hidden="true"></check-circle>
+                    <x-circle v-else-if="permission.status === 'denied'" :size="20" aria-hidden="true"></x-circle>
+                    <clock-3 v-else-if="permission.status === 'on_use'" :size="20" aria-hidden="true"></clock-3>
+                    <alert-circle v-else-if="permission.status === 'not_determined'" :size="20" aria-hidden="true"></alert-circle>
+                    <alert-triangle v-else :size="20" aria-hidden="true"></alert-triangle>
+                    <span class="visually-hidden">{{ $t('troubleshooting.permissions_status_' + permission.status) }}</span>
+                  </span>
+                </td>
+                <td>
+                  <span class="badge" :class="permission.required ? 'text-bg-primary' : 'text-bg-secondary'">
+                    {{ $t(permission.required ? 'troubleshooting.permissions_required' : 'troubleshooting.permissions_optional') }}
+                  </span>
+                </td>
+                <td class="permission-action-column">
+                  <button v-if="permission.status !== 'granted' && permission.requestable" class="btn btn-outline-primary"
+                          type="button" :disabled="permissionBusy === permission.id"
+                          @click="requestPermission(permission.id)">
+                    {{ $t(permission.id === 'local_network'
+                      ? 'troubleshooting.permissions_privacy_settings' : 'troubleshooting.permissions_request') }}
+                  </button>
+                  <button v-else-if="permission.status !== 'granted'" class="btn btn-outline-primary"
+                          type="button" @click="permissionHelp = permissionHelp === permission.id ? '' : permission.id">
+                    {{ $t('troubleshooting.permissions_instructions') }}
+                  </button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+    <!-- Virtual gamepad broker and license -->
+    <div class="card my-4 virtual-gamepad-card" v-if="platform === 'windows' || platform === 'macos'">
       <div class="card-body">
         <header class="virtual-gamepad-hero">
           <div class="virtual-gamepad-heading-icon" aria-hidden="true">
@@ -18,11 +80,19 @@
           </div>
           <div>
             <h2 id="virtualhid" class="mb-1">{{ $t('troubleshooting.virtual_gamepad') }}</h2>
-            <p class="mb-0">{{ $t('troubleshooting.virtual_gamepad_desc') }}</p>
+            <p class="mb-0">{{ $t(virtualInputDescriptionKey) }}</p>
+            <RouterLink v-if="platform === 'windows' && gamepadDriver === 'vigembus'"
+               class="btn btn-primary mt-3"
+               to="/config#gamepad_driver">
+              <gamepad-2 :size="18" class="icon"></gamepad-2>
+              {{ $t('troubleshooting.change_gamepad_driver') }}
+            </RouterLink>
           </div>
         </header>
 
-        <div class="virtual-gamepad-feature-grid" :aria-label="$t('troubleshooting.virtualhid_benefits_title')">
+        <div class="virtual-gamepad-feature-grid"
+             v-if="showVirtualhidBenefits"
+             :aria-label="$t('troubleshooting.virtualhid_benefits_title')">
           <article class="virtual-gamepad-feature">
             <div class="virtual-gamepad-feature-icon" aria-hidden="true">
               <gamepad-2 :size="21"></gamepad-2>
@@ -30,6 +100,15 @@
             <div>
               <h3>{{ $t('troubleshooting.virtualhid_benefit_gamepads_title') }}</h3>
               <p>{{ $t('troubleshooting.virtualhid_benefit_gamepads') }}</p>
+            </div>
+          </article>
+          <article class="virtual-gamepad-feature">
+            <div class="virtual-gamepad-feature-icon" aria-hidden="true">
+              <mouse-pointer-2 :size="21"></mouse-pointer-2>
+            </div>
+            <div>
+              <h3>{{ $t('troubleshooting.virtualhid_benefit_mouse_title') }}</h3>
+              <p>{{ $t('troubleshooting.virtualhid_benefit_mouse') }}</p>
             </div>
           </article>
           <article class="virtual-gamepad-feature">
@@ -52,7 +131,7 @@
           </article>
         </div>
 
-        <section class="virtual-gamepad-section" v-if="controllerEnabled">
+        <section class="virtual-gamepad-section" v-if="platform === 'windows' || platform === 'macos'">
           <div class="virtual-gamepad-section-heading">
             <div>
               <h3 class="h4 mb-1">{{ $t('troubleshooting.virtual_gamepad_drivers') }}</h3>
@@ -81,7 +160,7 @@
                 </tr>
               </thead>
               <tbody>
-                <tr>
+                <tr v-if="showVirtualhid">
                   <th scope="row">{{ $t('troubleshooting.virtualhid_driver') }}</th>
                   <td>{{ driverVersion(virtualhid) }}</td>
                   <td>
@@ -103,8 +182,12 @@
                   </td>
                   <td>{{ virtualhid.supported_versions }}</td>
                   <td>
-                    <span :class="driverStatusClass(virtualhid)">
-                      {{ driverStatusText(virtualhid) }}
+                    <span class="status-icon driver-status-icon" :class="driverStatusClass(virtualhid)"
+                          :title="driverStatusText(virtualhid)">
+                      <alert-circle v-if="!virtualhid.installed" :size="20" aria-hidden="true"></alert-circle>
+                      <check-circle v-else-if="virtualhid.version_compatible" :size="20" aria-hidden="true"></check-circle>
+                      <x-circle v-else :size="20" aria-hidden="true"></x-circle>
+                      <span class="visually-hidden">{{ driverStatusText(virtualhid) }}</span>
                     </span>
                   </td>
                   <td class="driver-download-column">
@@ -121,31 +204,24 @@
                   <th scope="row">{{ $t('troubleshooting.vigembus_driver') }}</th>
                   <td>{{ driverVersion(vigembus) }}</td>
                   <td>
-                    <div class="driver-release-state"
-                         :class="driverReleaseStateClass(vigembus, vigembusRelease)"
-                         :title="driverReleaseStatusText(vigembus, vigembusRelease)"
-                         aria-live="polite">
-                      <refresh-cw v-if="vigembusRelease.loading"
-                                  :size="17"
-                                  class="driver-release-spinning"></refresh-cw>
-                      <check-circle v-else-if="driverReleaseState(vigembus, vigembusRelease) === 'current'"
-                                    :size="17"></check-circle>
-                      <alert-triangle v-else-if="driverReleaseState(vigembus, vigembusRelease) === 'outdated'"
-                                      :size="17"></alert-triangle>
-                      <alert-circle v-else :size="17"></alert-circle>
-                      <span>{{ driverLatestVersion(vigembusRelease) }}</span>
+                    <div class="driver-release-state driver-release-neutral">
+                      <alert-circle :size="17"></alert-circle>
+                      <span>{{ $t('troubleshooting.driver_release_eol') }}</span>
                     </div>
-                    <small class="driver-release-detail">{{ driverReleaseStatusText(vigembus, vigembusRelease) }}</small>
                   </td>
                   <td>{{ vigembus.supported_versions }}</td>
                   <td>
-                    <span :class="driverStatusClass(vigembus)">
-                      {{ driverStatusText(vigembus) }}
+                    <span class="status-icon driver-status-icon" :class="driverStatusClass(vigembus)"
+                          :title="driverStatusText(vigembus)">
+                      <alert-circle v-if="!vigembus.installed" :size="20" aria-hidden="true"></alert-circle>
+                      <check-circle v-else-if="vigembus.version_compatible" :size="20" aria-hidden="true"></check-circle>
+                      <x-circle v-else :size="20" aria-hidden="true"></x-circle>
+                      <span class="visually-hidden">{{ driverStatusText(vigembus) }}</span>
                     </span>
                   </td>
                   <td class="driver-download-column">
                     <a class="btn btn-outline-primary driver-download-button"
-                       :href="vigembusRelease.url"
+                       href="https://github.com/nefarius/ViGEmBus/releases/latest"
                        target="_blank"
                        rel="noopener noreferrer">
                       <download :size="17"></download>
@@ -158,11 +234,11 @@
           </div>
         </section>
 
-        <section class="virtualhid-license-section" aria-labelledby="virtualhid-license">
+        <section class="virtualhid-license-section" aria-labelledby="virtualhid-license" v-if="showVirtualhid">
           <div class="virtualhid-license-heading">
             <div>
-              <h3 id="virtualhid-license" class="h4 mb-1">{{ $t('troubleshooting.virtualhid_license') }}</h3>
-              <p class="mb-0">{{ $t('troubleshooting.virtualhid_license_desc') }}</p>
+              <h3 id="virtualhid-license" class="h4 mb-1">{{ $t('troubleshooting.virtualhid_broker_license') }}</h3>
+              <p class="mb-0">{{ $t(platform === 'macos' ? 'troubleshooting.virtualhid_macos_license_desc' : 'troubleshooting.virtualhid_license_desc') }}</p>
             </div>
             <span :class="licenseStatusClass()">{{ licenseStatusText() }}</span>
           </div>
@@ -173,7 +249,7 @@
           </div>
           <div class="alert alert-warning alert-inline" role="alert" v-else-if="!virtualhidLicense.service_available">
             <alert-triangle :size="18" class="icon flex-shrink-0"></alert-triangle>
-            <span>{{ virtualhidLicense.message || $t('troubleshooting.virtualhid_license_unavailable') }}</span>
+            <span>{{ virtualhidLicense.message || $t('troubleshooting.virtualhid_broker_unavailable') }}</span>
           </div>
 
           <div class="virtualhid-license-stats">
@@ -182,8 +258,8 @@
               <dd>{{ virtualhidLicense.plan_name }}</dd>
             </dl>
             <dl class="virtualhid-license-stat">
-              <dt>{{ $t('troubleshooting.virtualhid_license_activations') }}</dt>
-              <dd>{{ licenseActivationText() }}</dd>
+              <dt>{{ $t('troubleshooting.virtualhid_license_activation_limit') }}</dt>
+              <dd>{{ licenseActivationLimitText() }}</dd>
             </dl>
             <dl class="virtualhid-license-stat">
               <dt>{{ $t('troubleshooting.virtualhid_license_active_devices') }}</dt>
@@ -223,11 +299,12 @@
                rel="noopener noreferrer">
               {{ $t('troubleshooting.virtualhid_license_buy') }}
             </a>
-            <button class="btn btn-outline-danger"
+            <button class="btn btn-danger"
                     type="button"
                     v-if="virtualhidLicense.licensed"
                     :disabled="licenseBusy || !virtualhidLicense.service_available"
                     @click="updateLicense('deactivate')">
+              <trash-2 :size="18" class="icon"></trash-2>
               {{ $t('troubleshooting.virtualhid_license_deactivate') }}
             </button>
           </div>
@@ -262,7 +339,7 @@
             <check-circle :size="22" aria-hidden="true"></check-circle>
             <div>
               <strong>{{ $t('troubleshooting.virtualhid_license_machine_activated') }}</strong>
-              <p class="mb-0">{{ $t('troubleshooting.virtualhid_license_machine_activated_desc') }}</p>
+              <p class="mb-0">{{ $t('troubleshooting.virtualhid_broker_activated_desc') }}</p>
             </div>
           </div>
         </section>
@@ -302,6 +379,27 @@
           <button class="btn btn-warning" :disabled="restartPressed" @click="restart">
             <refresh-cw :size="18" class="icon"></refresh-cw>
             {{ $t('troubleshooting.restart_sunshine') }}
+          </button>
+        </div>
+      </div>
+    </div>
+    <!-- Reset XDG Portal restore token -->
+    <div class="card my-4" v-if="platform === 'linux' || platform === 'freebsd'">
+      <div class="card-body">
+        <h2 id="portal_reset">{{ $t('troubleshooting.portal_reset') }}</h2>
+        <p>{{ $t('troubleshooting.portal_reset_desc') }}</p>
+        <div class="alert alert-success" v-if="portalResetStatus === true">
+          <check-circle :size="18" class="icon"></check-circle>
+          {{ $t('troubleshooting.portal_reset_success') }}
+        </div>
+        <div class="alert alert-danger" v-if="portalResetStatus === false">
+          <alert-circle :size="18" class="icon"></alert-circle>
+          {{ $t('troubleshooting.portal_reset_error') }}
+        </div>
+        <div>
+          <button class="btn btn-warning" :disabled="portalResetPressed" @click="resetPortalToken">
+            <rotate-ccw :size="18" class="icon"></rotate-ccw>
+            {{ $t('troubleshooting.portal_reset') }}
           </button>
         </div>
       </div>
@@ -382,10 +480,11 @@
         <div class="d-flex justify-content-between align-items-baseline py-2">
           <p>{{ $t('troubleshooting.logs_desc') }}</p>
           <div class="input-group" style="max-width: 300px">
+            <label for="log-filter" class="visually-hidden">{{ $t('troubleshooting.logs_find') }}</label>
             <span class="input-group-text">
               <search :size="18" class="icon"></search>
             </span>
-            <input type="text" class="form-control" v-model="logFilter" :placeholder="$t('troubleshooting.logs_find')" />
+            <input id="log-filter" type="text" class="form-control" v-model="logFilter" :placeholder="$t('troubleshooting.logs_find')" />
           </div>
         </div>
         <div>
@@ -417,9 +516,9 @@
     </div>
   </div>
 
-  <script type="module">
-    import { createApp } from 'vue'
-    import { initApp } from './init'
+</template>
+
+<script>
     import Navbar from './Navbar.vue'
     import { apiFetch } from './fetch_utils'
     import {
@@ -431,11 +530,13 @@
       ChevronUp,
       ChevronsDown,
       ChevronsUp,
+      Clock3,
       Copy,
       Download,
       ExternalLink,
       Gamepad2,
       KeyRound,
+      MousePointer2,
       RefreshCw,
       RotateCcw,
       Search,
@@ -445,7 +546,9 @@
       XCircle,
     } from '@lucide/vue'
 
-    const app = createApp({
+    const permissionOrder = ['screen_recording', 'input', 'notifications', 'microphone', 'system_audio', 'local_network'];
+
+    export default {
       components: {
         Navbar,
         AlertCircle,
@@ -456,11 +559,13 @@
         ChevronUp,
         ChevronsDown,
         ChevronsUp,
+        Clock3,
         Copy,
         Download,
         ExternalLink,
         Gamepad2,
         KeyRound,
+        MousePointer2,
         RefreshCw,
         RotateCcw,
         Search,
@@ -483,11 +588,16 @@
           licenseBusy: false,
           licenseError: '',
           licenseKey: '',
+          portalResetPressed: false,
+          portalResetStatus: null,
+          permissions: [],
+          permissionBusy: '',
+          permissionError: '',
+          permissionHelp: '',
           restartPressed: false,
           showApplyMessage: false,
           platform: "",
-          controllerEnabled: false,
-          virtualInputStatusLoaded: false,
+          gamepadDriver: '',
           unpairAllPressed: false,
           unpairAllStatus: null,
           virtualhid: {
@@ -524,17 +634,54 @@
             minimum_version: '',
             supported_versions: '',
           },
-          vigembusRelease: {
-            loading: false,
-            version: '',
-            url: 'https://github.com/nefarius/ViGEmBus/releases/latest',
-            error: false,
-          },
           currentLogIndex: -1,
           logLines: [],
         };
       },
       computed: {
+        /** Keep known permissions in troubleshooting order on every platform. */
+        orderedPermissions() {
+          return this.permissions.slice().sort((left, right) => {
+            const leftRank = permissionOrder.indexOf(left.id);
+            const rightRank = permissionOrder.indexOf(right.id);
+            return (leftRank < 0 ? permissionOrder.length : leftRank) -
+              (rightRank < 0 ? permissionOrder.length : rightRank);
+          });
+        },
+
+        showVirtualhid() {
+          return this.gamepadDriver !== 'none' && (this.platform === 'macos' || this.gamepadDriver !== 'vigembus');
+        },
+
+        showVigembus() {
+          return this.platform === 'windows' && this.gamepadDriver !== 'none' && this.gamepadDriver !== 'virtualhid';
+        },
+
+        showVirtualhidBenefits() {
+          return this.platform === 'windows' && this.gamepadDriver !== 'none' && !(this.virtualhid.installed && this.virtualhidLicense.licensed);
+        },
+
+        virtualInputDescriptionKey() {
+          if (this.gamepadDriver === 'none') {
+            return 'troubleshooting.virtual_gamepad_none_desc';
+          }
+          if (this.platform === 'macos') {
+            return 'troubleshooting.virtual_gamepad_macos_desc';
+          }
+          if (!this.gamepadDriver) {
+            return 'troubleshooting.virtual_gamepad_unset_desc';
+          }
+          if (this.gamepadDriver === 'vigembus') {
+            return 'troubleshooting.virtual_gamepad_vigembus_desc';
+          }
+          if (this.virtualhid.installed && this.virtualhidLicense.licensed) {
+            return this.gamepadDriver === 'all' ?
+              'troubleshooting.virtual_gamepad_licensed_all_desc' :
+              'troubleshooting.virtual_gamepad_licensed_desc';
+          }
+          return 'troubleshooting.virtual_gamepad_desc';
+        },
+
         actualLogs() {
           if (!this.logFilter) return this.logs;
           const filterLower = this.logFilter.toLowerCase();
@@ -653,11 +800,7 @@
         },
 
         driverReleaseLoading() {
-          return this.virtualhidRelease.loading || (this.showVigembus && this.vigembusRelease.loading);
-        },
-
-        showVigembus() {
-          return this.virtualInputStatusLoaded && (!this.virtualhid.installed || this.vigembus.installed);
+          return this.showVirtualhid && this.virtualhidRelease.loading;
         }
       },
       created() {
@@ -666,26 +809,60 @@
           .then((r) => r.json())
           .then((r) => {
             this.platform = r.platform;
-            this.controllerEnabled = r.controller !== "disabled";
-            // Fetch virtual input driver status only on Windows when gamepad is enabled
-            if (this.platform === 'windows' && this.controllerEnabled) {
+            this.gamepadDriver = r.gamepad_driver || '';
+            this.refreshPermissions();
+            // The Windows broker also backs relative mouse input when gamepads are disabled.
+            if (this.platform === 'windows' || this.platform === 'macos') {
               this.refreshDriverInformation();
             }
-            if (this.platform === 'windows') {
+            if ((this.platform === 'windows' || this.platform === 'macos') && this.showVirtualhid) {
               this.refreshLicenseStatus();
             }
           });
 
         this.logInterval = setInterval(() => {
           this.refreshLogs();
+          if (this.platform) this.refreshPermissions();
         }, 5000);
         this.refreshLogs();
         this.refreshClients();
       },
-      beforeDestroy() {
+      beforeUnmount() {
         clearInterval(this.logInterval);
+        if (this._logsCopyTimeout) clearTimeout(this._logsCopyTimeout);
       },
       methods: {
+        /** Refresh the current platform's permission status. */
+        async refreshPermissions() {
+          try {
+            const response = await fetch('./api/permissions');
+            if (!response.ok) throw new Error(this.$t('troubleshooting.permissions_error'));
+            this.permissions = (await response.json()).permissions || [];
+            this.permissionError = '';
+          } catch (error) {
+            this.permissionError = error.message;
+          }
+        },
+        /** Initiate the selected native permission action. */
+        async requestPermission(id) {
+          this.permissionBusy = id;
+          try {
+            const response = await apiFetch('./api/permissions/request', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ id }),
+            });
+            if (!response.ok) throw new Error(this.$t('troubleshooting.permissions_error'));
+            if (id === 'local_network' || (this.platform === 'macos' && (id === 'screen_recording' || id === 'input'))) {
+              this.permissionHelp = id;
+            }
+            await this.refreshPermissions();
+          } catch (error) {
+            this.permissionError = error.message;
+          } finally {
+            this.permissionBusy = '';
+          }
+        },
         refreshLogs() {
           fetch("./api/logs",)
             .then((r) => r.text())
@@ -754,7 +931,6 @@
           fetch("./api/clients/list")
             .then((response) => response.json())
             .then((response) => {
-              const clientList = document.querySelector("#client-list");
               if (response.status === true && response.named_certs && response.named_certs.length) {
                 this.clients = response.named_certs.sort((a, b) => {
                   return (a.name.toLowerCase() > b.name.toLowerCase() || a.name === "" ? 1 : -1)
@@ -796,6 +972,35 @@
             }
           });
         },
+        resetPortalToken() {
+          this.portalResetPressed = true;
+          apiFetch("./api/reset-portal-token", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json"
+            }
+          })
+            .then((r) => r.json())
+            .then((r) => {
+              this.portalResetStatus = r.status;
+              if (r.status) {
+                apiFetch("./api/restart", {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/json"
+                  }
+                });
+              }
+              setTimeout(() => {
+                this.portalResetPressed = false;
+                this.portalResetStatus = null;
+              }, 5000);
+            })
+            .catch(() => {
+              this.portalResetPressed = false;
+              this.portalResetStatus = false;
+            });
+        },
         ddResetPersistence() {
           this.ddResetPressed = true;
           apiFetch("/api/reset-display-device-persistence", {
@@ -814,26 +1019,23 @@
             });
         },
         /**
-         * @brief Refresh the installed driver details and latest stable GitHub releases.
+         * @brief Refresh the installed backend details and latest stable Virtual HID Broker release.
          */
         refreshDriverInformation() {
           this.refreshVirtualInputStatus();
           this.refreshDriverReleases();
         },
         /**
-         * @brief Refresh the latest stable release metadata for both Windows gamepad drivers.
+         * @brief Refresh the latest stable release metadata for Virtual HID Broker.
          */
         refreshDriverReleases() {
-          this.updateLatestRelease(
-            'virtualhidRelease',
-            'LizardByte/libvirtualhid',
-            'https://github.com/LizardByte/libvirtualhid/releases/latest',
-          );
-          this.updateLatestRelease(
-            'vigembusRelease',
-            'nefarius/ViGEmBus',
-            'https://github.com/nefarius/ViGEmBus/releases/latest',
-          );
+          if (this.showVirtualhid) {
+            this.updateLatestRelease(
+              'virtualhidRelease',
+              'LizardByte/libvirtualhid',
+              'https://github.com/LizardByte/libvirtualhid/releases/latest',
+            );
+          }
         },
         /**
          * @brief Fetch one repository's latest non-prerelease release from GitHub.
@@ -901,7 +1103,6 @@
                 minimum_version: vigembus.minimum_version || '',
                 supported_versions: vigembus.supported_versions || '',
               };
-              this.virtualInputStatusLoaded = true;
             })
             .catch((err) => {
               console.error("Failed to fetch virtual input driver status:", err);
@@ -1080,11 +1281,11 @@
           const key = `troubleshooting.virtualhid_license_state_${this.virtualhidLicense.state}`;
           return this.$t(key);
         },
-        licenseActivationText() {
+        licenseActivationLimitText() {
           if (!this.virtualhidLicense.activation_limit) {
             return this.$t('troubleshooting.virtualhid_license_not_reported');
           }
-          return `${this.virtualhidLicense.activation_usage} / ${this.virtualhidLicense.activation_limit}`;
+          return String(this.virtualhidLicense.activation_limit);
         },
         driverVersion(driver) {
           if (!driver.installed) {
@@ -1092,11 +1293,30 @@
           }
           return driver.version || this.$t('troubleshooting.driver_version_unknown');
         },
+        /**
+         * @brief Choose a visual state for a permission status icon.
+         *
+         * @param {string} status Permission status returned by the platform.
+         * @return {string} Theme-aware status icon class.
+         */
+        permissionStatusClass(status) {
+          if (status === 'granted') return 'status-icon-success';
+          if (status === 'denied') return 'status-icon-danger';
+          if (status === 'on_use') return 'status-icon-primary';
+          if (status === 'not_determined') return 'status-icon-neutral';
+          return 'status-icon-warning';
+        },
+        /**
+         * @brief Choose a visual state for a virtual input backend status icon.
+         *
+         * @param {object} driver Installed backend status.
+         * @return {string} Theme-aware status icon class.
+         */
         driverStatusClass(driver) {
           if (!driver.installed) {
-            return 'badge text-bg-secondary';
+            return 'status-icon-neutral';
           }
-          return driver.version_compatible ? 'badge text-bg-success' : 'badge text-bg-danger';
+          return driver.version_compatible ? 'status-icon-success' : 'status-icon-danger';
         },
         driverStatusText(driver) {
           if (!driver.installed) {
@@ -1164,9 +1384,5 @@
           }
         },
       },
-    });
-
-    initApp(app);
+    }
   </script>
-
-</body>

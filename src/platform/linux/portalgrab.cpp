@@ -2,8 +2,17 @@
  * @file src/platform/linux/portalgrab.cpp
  * @brief Definitions for XDG portal grab.
  */
+// standard includes
+#include <algorithm>
+#include <cctype>
+#include <cstdlib>
+
+// lib includes
+#include <lizardbyte/common/env.h>
+
 // local includes
 #include "pipewire.cpp"
+#include "src/globals.h"
 
 #include <filesystem>
 
@@ -100,6 +109,25 @@ namespace portal {
     }
 
     /**
+     * @brief Check if a Portal restore token exists on disk without inspecting its contents.
+     *
+     * @return True if file exists on disk.
+     */
+    static bool exists() {
+      std::error_code ec;
+      return std::filesystem::exists(get_file_path(), ec);
+    }
+
+    /**
+     * @brief Clear a restore token if it already exists on disk.
+     */
+    static void clear() {
+      std::error_code ec;
+      token_->clear();
+      std::filesystem::remove(get_file_path(), ec);
+    }
+
+    /**
      * @brief Save current state to its backing store.
      */
     static void save() {
@@ -116,39 +144,126 @@ namespace portal {
     }
 
     /**
-     * @brief Forget an unusable restored permission for this capture target.
+     * @brief Get file path of the XDG Portal restore token.
+     *
+     * The token filename is suffixed with the XDG session desktop when set in the environment.
+     *
+     * @param directory Directory containing saved tokens; defaults to the application data directory.
+     * @param desktop Session desktop; defaults to the XDG_SESSION_DESKTOP environment variable.
+     * @return File path.
      */
-    static void clear() {
-      token_->clear();
-      std::error_code error;
-      const bool removed = std::filesystem::remove(get_file_path(), error);
-      if (error) {
-        BOOST_LOG(warning) << "[portalgrab] Failed to clear portal restore token: "sv << error.message();
-      } else if (removed) {
-        BOOST_LOG(info) << "[portalgrab] Cleared portal restore token after a failed restore"sv;
+    static std::filesystem::path get_file_path(
+      const std::filesystem::path &directory = platf::appdata(),
+      const std::string &desktop = lizardbyte::common::get_env("XDG_SESSION_DESKTOP")
+    ) {
+      std::string token_name = "portal_token";
+      const auto scope = get_portal_token_scope();
+      if (!scope.empty()) {
+        token_name += "_" + std::string(scope);
+        if (const char *output = std::getenv("MONITORIZE_CAPTURE_OUTPUT"); output && *output) {
+          constexpr char hex[] = "0123456789abcdef";
+          token_name += "_";
+          for (const unsigned char c : std::string(output)) {
+            token_name += hex[c >> 4];
+            token_name += hex[c & 15];
+          }
+        }
       }
+      const std::filesystem::path legacy_path = directory / token_name;
+
+      std::string suffix(desktop);
+      boost::algorithm::to_lower(suffix);
+
+      // Restrict the suffix to prevent path traversal and other invalid filename characters.
+      if (const bool is_safe = !suffix.empty() && std::all_of(suffix.begin(), suffix.end(), [](unsigned char c) {
+            return std::isalnum(c) || c == '_' || c == '-';
+          });
+          !is_safe) {
+        BOOST_LOG(warning) << "[portalgrab] XDG session desktop type cannot be determined. Using .unknown suffix for Portal restore token."sv;
+        suffix = "unknown";
+      }
+
+      const std::filesystem::path suffixed_path = directory / (token_name + "." + suffix);
+
+      // One-time migration of legacy portal_token.
+      std::error_code ec;
+      if (!std::filesystem::exists(suffixed_path, ec) && !ec) {
+        const bool legacy_exists = std::filesystem::exists(legacy_path, ec);
+
+        if (!ec && legacy_exists) {
+          // Attempt one-time adoption of a pre-upgrade token. Best-effort guess that it belongs
+          // to this session type; if wrong, we're no worse off than not migrating.
+          std::filesystem::rename(legacy_path, suffixed_path, ec);
+          if (ec) {
+            BOOST_LOG(error) << "[portalgrab] Portal restore token migration failed: "sv << ec.message();
+          } else {
+            BOOST_LOG(info) << "[portalgrab] Portal restore token migrated to portal_token."sv << suffix;
+          }
+        }
+      }
+
+      return suffixed_path;
     }
 
   private:
     static inline const std::unique_ptr<std::string> token_ = std::make_unique<std::string>();
-
-    static std::string get_file_path() {
-      const auto scope = get_portal_token_scope();
-      if (!scope.empty()) {
-        if (const char *target = std::getenv("MONITORIZE_CAPTURE_OUTPUT"); target && *target) {
-          std::string suffix;
-          constexpr char hex[] = "0123456789abcdef";
-          for (unsigned char c : std::string(target)) {
-            suffix += hex[c >> 4];
-            suffix += hex[c & 15];
-          }
-          return platf::appdata().string() + "/portal_token_" + std::string(scope) + "_" + suffix;
-        }
-        return platf::appdata().string() + "/portal_token_" + std::string(scope);
-      }
-      return platf::appdata().string() + "/portal_token";
-    }
   };
+
+  /**
+   * @brief Clear a restore token if it already exists on disk.
+   */
+  void clear_saved_token() {
+    restore_token_t::clear();
+  }
+
+  /**
+   * @brief Check if a Portal restore token exists on disk without inspecting its contents.
+   *
+   * @return True if a saved token was found.
+   */
+  bool has_saved_token() {
+    return restore_token_t::exists();
+  }
+
+  /**
+   * @brief Check if the Portal service responds to a DBus Ping within 2 seconds.
+   *
+   * @return True if the Portal is reachable.
+   */
+  bool is_portal_service_reachable() {
+    g_autoptr(GError) g_error = nullptr;
+    g_autofree const gchar *address = g_dbus_address_get_for_bus_sync(G_BUS_TYPE_SESSION, nullptr, &g_error);
+    if (!address) {
+      return false;
+    }
+
+    g_autoptr(GError) ping_error = nullptr;
+    g_autoptr(GDBusConnection) conn = g_dbus_connection_new_for_address_sync(
+      address,
+      GDBusConnectionFlags(G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT | G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION),
+      nullptr,
+      nullptr,
+      &ping_error
+    );
+    if (!conn) {
+      return false;
+    }
+
+    g_autoptr(GVariant) reply = g_dbus_connection_call_sync(
+      conn,
+      "org.freedesktop.portal.Desktop",
+      "/org/freedesktop/portal/desktop",
+      "org.freedesktop.DBus.Peer",
+      "Ping",
+      nullptr,
+      nullptr,
+      G_DBUS_CALL_FLAGS_NONE,
+      2000,
+      nullptr,
+      &ping_error
+    );
+    return reply != nullptr;
+  }
 
   /**
    * @brief DBus response loop and response variant for portal calls.
@@ -157,7 +272,24 @@ namespace portal {
     GMainLoop *loop;  ///< GLib main loop waiting for a portal response signal.
     GVariant *response;  ///< DBus response payload returned by the portal.
     guint subscription_id;  ///< Subscription ID.
+    std::string request_path;  ///< For Request.Close() on cancellation.
+    GDBusConnection *conn;  ///< Borrowed — owned by the calling dbus_t/portal_t.
   };
+
+  /**
+   * @brief Get path of the XDG Portal restore token.
+   *
+   * @return Path of token that may include the session desktop as a suffix (e.g. .gnome, .kde).
+   */
+  std::filesystem::path get_saved_token_path() {
+    return restore_token_t::get_file_path();
+  }
+
+#ifdef SUNSHINE_TESTS
+  std::filesystem::path get_saved_token_path_for_testing(const std::filesystem::path &directory, const std::string &desktop) {
+    return restore_token_t::get_file_path(directory, desktop);
+  }
+#endif
 
   /**
    * @brief PipeWire stream node and negotiated capture size.
@@ -206,6 +338,8 @@ namespace portal {
    */
   class dbus_t {
   public:
+    guint dbus_timeout = 10;  ///< Timeout in seconds for DBus calls.
+
     dbus_t &operator=(dbus_t &&) = delete;  // Do not allow to copying
 
     ~dbus_t() noexcept {
@@ -249,7 +383,7 @@ namespace portal {
           nullptr,
           nullptr,
           G_DBUS_CALL_FLAGS_NONE,
-          -1,
+          dbus_timeout * 1000,
           nullptr,
           &err
         );
@@ -274,15 +408,47 @@ namespace portal {
     int init() {
       restore_token_t::load();
 
-      conn = g_bus_get_sync(G_BUS_TYPE_SESSION, nullptr, nullptr);
+      g_autoptr(GError) g_error = nullptr;
+      g_autofree gchar *address = g_dbus_address_get_for_bus_sync(G_BUS_TYPE_SESSION, nullptr, &g_error);
+      if (!address) {
+        return -1;
+      }
+
+      conn = g_dbus_connection_new_for_address_sync(
+        address,
+        GDBusConnectionFlags(G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT | G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION),
+        nullptr,
+        nullptr,
+        &g_error
+      );
       if (!conn) {
         return -1;
       }
-      remote_desktop_proxy = g_dbus_proxy_new_sync(conn, G_DBUS_PROXY_FLAGS_NONE, nullptr, PORTAL_NAME, PORTAL_PATH, REMOTE_DESKTOP_IFACE, nullptr, nullptr);
+
+      remote_desktop_proxy = g_dbus_proxy_new_sync(
+        conn,
+        G_DBUS_PROXY_FLAGS_NONE,
+        nullptr,
+        PORTAL_NAME,
+        PORTAL_PATH,
+        REMOTE_DESKTOP_IFACE,
+        nullptr,
+        &g_error
+      );
       if (!remote_desktop_proxy) {
         return -1;
       }
-      screencast_proxy = g_dbus_proxy_new_sync(conn, G_DBUS_PROXY_FLAGS_NONE, nullptr, PORTAL_NAME, PORTAL_PATH, SCREENCAST_IFACE, nullptr, nullptr);
+
+      screencast_proxy = g_dbus_proxy_new_sync(
+        conn,
+        G_DBUS_PROXY_FLAGS_NONE,
+        nullptr,
+        PORTAL_NAME,
+        PORTAL_PATH,
+        SCREENCAST_IFACE,
+        nullptr,
+        &g_error
+      );
       if (!screencast_proxy) {
         return -1;
       }
@@ -293,10 +459,12 @@ namespace portal {
     /**
      * @brief Connect to xdg-desktop-portal and restore or create a screencast session.
      *
+     * @param allow_start_timeout True if "Start" DBus call is allowed to time out.
      * @return 0 when a portal session is ready; nonzero when D-Bus or portal setup fails.
      */
-    int connect_to_portal() {
-      g_autoptr(GMainLoop) loop = g_main_loop_new(nullptr, FALSE);
+    int connect_to_portal(bool allow_start_timeout) {
+      g_autoptr(GMainContext) context = g_main_context_new();
+      g_autoptr(GMainLoop) loop = g_main_loop_new(context, false);
       bool retried_without_token = false;
       while (true) {
         const bool used_restore_token = !restore_token_t::empty();
@@ -318,7 +486,7 @@ namespace portal {
         }
 
         const auto start_result = start_portal_session(
-          loop, session_path, pipewire_streams, use_screencast_only
+          loop, session_path, pipewire_streams, use_screencast_only, allow_start_timeout
         );
         bool retry_without_token = (
           used_restore_token && !retried_without_token &&
@@ -430,7 +598,7 @@ namespace portal {
           g_variant_new("(ss)", "org.freedesktop.portal.Session", "version"),
           G_VARIANT_TYPE("(v)"),
           G_DBUS_CALL_FLAGS_NONE,
-          -1,
+          dbus_timeout * 1000,
           nullptr,
           &err
         );
@@ -445,7 +613,7 @@ namespace portal {
     }
 
     std::vector<pipewire_streaminfo_t> pipewire_streams;  ///< Pipewire streams.
-    int pipewire_fd;  ///< Pipewire fd.
+    int pipewire_fd = -1;  ///< Owned remote descriptor until transferred to PipeWire.
 
   private:
     GDBusConnection *conn;
@@ -456,9 +624,7 @@ namespace portal {
       GDBusProxy *proxy = use_screencast ? screencast_proxy : remote_desktop_proxy;
       const char *session_type = use_screencast ? "ScreenCast" : "RemoteDesktop";
 
-      dbus_response_t response = {
-        nullptr,
-      };
+      dbus_response_t response {};
       g_autofree gchar *request_token = nullptr;
       create_request_path(conn, nullptr, &request_token);
 
@@ -470,7 +636,7 @@ namespace portal {
       g_variant_builder_close(&builder);
 
       g_autoptr(GError) err = nullptr;
-      g_autoptr(GVariant) reply = g_dbus_proxy_call_sync(proxy, "CreateSession", g_variant_builder_end(&builder), G_DBUS_CALL_FLAGS_NONE, -1, nullptr, &err);
+      g_autoptr(GVariant) reply = g_dbus_proxy_call_sync(proxy, "CreateSession", g_variant_builder_end(&builder), G_DBUS_CALL_FLAGS_NONE, dbus_timeout * 1000, nullptr, &err);
 
       if (err) {
         BOOST_LOG(error) << "[portalgrab] Could not create "sv << session_type << " session: "sv << err->message;
@@ -481,7 +647,7 @@ namespace portal {
       g_variant_get(reply, "(o)", &request_path);
       dbus_response_init(&response, loop, conn, request_path);
 
-      g_autoptr(GVariant) create_response = dbus_response_wait(&response);
+      g_autoptr(GVariant) create_response = dbus_response_wait(&response, dbus_timeout);
 
       if (!create_response) {
         BOOST_LOG(error) << "[portalgrab] " << session_type << " CreateSession: no response received"sv;
@@ -519,9 +685,7 @@ namespace portal {
     }
 
     int select_remote_desktop_devices(GMainLoop *loop, const gchar *session_path) {
-      dbus_response_t response = {
-        nullptr,
-      };
+      dbus_response_t response {};
       g_autofree gchar *request_token = nullptr;
       create_request_path(conn, nullptr, &request_token);
 
@@ -538,7 +702,7 @@ namespace portal {
       g_variant_builder_close(&builder);
 
       g_autoptr(GError) err = nullptr;
-      g_autoptr(GVariant) reply = g_dbus_proxy_call_sync(remote_desktop_proxy, "SelectDevices", g_variant_builder_end(&builder), G_DBUS_CALL_FLAGS_NONE, -1, nullptr, &err);
+      g_autoptr(GVariant) reply = g_dbus_proxy_call_sync(remote_desktop_proxy, "SelectDevices", g_variant_builder_end(&builder), G_DBUS_CALL_FLAGS_NONE, dbus_timeout * 1000, nullptr, &err);
 
       if (err) {
         BOOST_LOG(error) << "[portalgrab] Could not select devices: "sv << err->message;
@@ -549,7 +713,7 @@ namespace portal {
       g_variant_get(reply, "(o)", &request_path);
       dbus_response_init(&response, loop, conn, request_path);
 
-      g_autoptr(GVariant) devices_response = dbus_response_wait(&response);
+      g_autoptr(GVariant) devices_response = dbus_response_wait(&response, dbus_timeout);
 
       if (!devices_response) {
         BOOST_LOG(error) << "[portalgrab] SelectDevices: no response received"sv;
@@ -569,9 +733,7 @@ namespace portal {
     }
 
     int select_screencast_sources(GMainLoop *loop, const gchar *session_path, bool persist) {
-      dbus_response_t response = {
-        nullptr,
-      };
+      dbus_response_t response {};
       g_autofree gchar *request_token = nullptr;
       create_request_path(conn, nullptr, &request_token);
 
@@ -592,7 +754,7 @@ namespace portal {
       g_variant_builder_close(&builder);
 
       g_autoptr(GError) err = nullptr;
-      g_autoptr(GVariant) reply = g_dbus_proxy_call_sync(screencast_proxy, "SelectSources", g_variant_builder_end(&builder), G_DBUS_CALL_FLAGS_NONE, -1, nullptr, &err);
+      g_autoptr(GVariant) reply = g_dbus_proxy_call_sync(screencast_proxy, "SelectSources", g_variant_builder_end(&builder), G_DBUS_CALL_FLAGS_NONE, dbus_timeout * 1000, nullptr, &err);
       if (err) {
         BOOST_LOG(error) << "[portalgrab] Could not select sources: "sv << err->message;
         return -1;
@@ -602,7 +764,7 @@ namespace portal {
       g_variant_get(reply, "(o)", &request_path);
       dbus_response_init(&response, loop, conn, request_path);
 
-      g_autoptr(GVariant) sources_response = dbus_response_wait(&response);
+      g_autoptr(GVariant) sources_response = dbus_response_wait(&response, dbus_timeout);
 
       if (!sources_response) {
         BOOST_LOG(error) << "[portalgrab] SelectSources: no response received"sv;
@@ -621,13 +783,11 @@ namespace portal {
       return 0;
     }
 
-    portal_start_result_e start_portal_session(GMainLoop *loop, const gchar *session_path, std::vector<pipewire_streaminfo_t> &out_pipewire_streams, bool use_screencast) {
+    portal_start_result_e start_portal_session(GMainLoop *loop, const gchar *session_path, std::vector<pipewire_streaminfo_t> &out_pipewire_streams, bool use_screencast, bool allow_start_timeout) {
       GDBusProxy *proxy = use_screencast ? screencast_proxy : remote_desktop_proxy;
       const char *session_type = use_screencast ? "ScreenCast" : "RemoteDesktop";
 
-      dbus_response_t response = {
-        nullptr,
-      };
+      dbus_response_t response {};
       g_autofree gchar *request_token = nullptr;
       create_request_path(conn, nullptr, &request_token);
 
@@ -640,7 +800,7 @@ namespace portal {
       g_variant_builder_close(&builder);
 
       g_autoptr(GError) err = nullptr;
-      g_autoptr(GVariant) reply = g_dbus_proxy_call_sync(proxy, "Start", g_variant_builder_end(&builder), G_DBUS_CALL_FLAGS_NONE, -1, nullptr, &err);
+      g_autoptr(GVariant) reply = g_dbus_proxy_call_sync(proxy, "Start", g_variant_builder_end(&builder), G_DBUS_CALL_FLAGS_NONE, dbus_timeout * 1000, nullptr, &err);
       if (err) {
         BOOST_LOG(error) << "[portalgrab] Could not start "sv << session_type << " session: "sv << err->message;
         return portal_start_result_e::failed;
@@ -650,7 +810,7 @@ namespace portal {
       g_variant_get(reply, "(o)", &request_path);
       dbus_response_init(&response, loop, conn, request_path);
 
-      g_autoptr(GVariant) start_response = dbus_response_wait(&response);
+      g_autoptr(GVariant) start_response = dbus_response_wait(&response, (allow_start_timeout ? dbus_timeout : 0));
 
       if (!start_response) {
         BOOST_LOG(error) << "[portalgrab] " << session_type << " Start: no response received"sv;
@@ -711,7 +871,14 @@ namespace portal {
           out_pipewire_object_serial = SPA_ID_INVALID;
         }
 
-        auto stream = pipewire_streaminfo_t {out_pipewire_node, out_pipewire_object_serial, out_width, out_height, out_pos_x, out_pos_y};
+        auto stream = pipewire_streaminfo_t {
+          .pipewire_node = out_pipewire_node,
+          .pipewire_object_serial = out_pipewire_object_serial,
+          .width = out_width,
+          .height = out_height,
+          .pos_x = out_pos_x,
+          .pos_y = out_pos_y,
+        };
 
         int match_width = out_width, match_height = out_height;
         g_variant_lookup(value, "logical_size", "(ii)", &match_width, &match_height);
@@ -743,7 +910,7 @@ namespace portal {
       g_autoptr(GVariant) msg = g_variant_ref_sink(g_variant_new("(oa{sv})", session_path, nullptr));
 
       g_autoptr(GError) err = nullptr;
-      g_autoptr(GVariant) reply = g_dbus_proxy_call_with_unix_fd_list_sync(screencast_proxy, "OpenPipeWireRemote", msg, G_DBUS_CALL_FLAGS_NONE, -1, nullptr, &fd_list, nullptr, &err);
+      g_autoptr(GVariant) reply = g_dbus_proxy_call_with_unix_fd_list_sync(screencast_proxy, "OpenPipeWireRemote", msg, G_DBUS_CALL_FLAGS_NONE, dbus_timeout * 1000, nullptr, &fd_list, nullptr, &err);
       if (err) {
         BOOST_LOG(error) << "[portalgrab] Could not open pipewire remote: "sv << err->message;
         return -1;
@@ -799,14 +966,128 @@ namespace portal {
       }
     }
 
-    static void dbus_response_init(struct dbus_response_t *response, GMainLoop *loop, GDBusConnection *conn, const char *request_path) {
-      response->loop = loop;
-      response->subscription_id = g_dbus_connection_signal_subscribe(conn, PORTAL_NAME, REQUEST_IFACE, "Response", request_path, nullptr, G_DBUS_SIGNAL_FLAGS_NONE, on_response_received_cb, response, nullptr);
+    /**
+     * @brief Asynchronously close a pending Portal request.
+     */
+    static void close_request_async(GDBusConnection *conn, const std::string &request_path) {
+      g_dbus_connection_call(
+        conn,
+        PORTAL_NAME,
+        request_path.c_str(),
+        REQUEST_IFACE,
+        "Close",
+        nullptr,
+        nullptr,
+        G_DBUS_CALL_FLAGS_NONE,
+        -1,
+        nullptr,
+        nullptr,
+        nullptr
+      );
     }
 
-    static GVariant *dbus_response_wait(struct dbus_response_t *response) {
+    static void dbus_response_init(struct dbus_response_t *response, GMainLoop *loop, GDBusConnection *conn, const char *request_path) {
+      response->loop = loop;
+      response->conn = conn;
+      response->request_path = request_path;
+
+      GMainContext *context = g_main_loop_get_context(loop);
+      g_main_context_push_thread_default(context);
+
+      response->subscription_id = g_dbus_connection_signal_subscribe(
+        conn,
+        PORTAL_NAME,
+        REQUEST_IFACE,
+        "Response",
+        request_path,
+        nullptr,
+        G_DBUS_SIGNAL_FLAGS_NONE,
+        on_response_received_cb,
+        response,
+        nullptr
+      );
+
+      g_main_context_pop_thread_default(context);
+    }
+
+    /**
+     * @brief Data for loop and shutdown_event mail used by check_shutdown_cb().
+     */
+    struct loop_context_t {
+      GMainLoop *loop;
+      std::shared_ptr<safe::event_t<bool>> shutdown_event;
+    };
+
+    /**
+     * @brief Check for Sunshine shutdown and quit the Portal response loop if requested.
+     *
+     * @result True (continue) if shutdown event is not in progress.
+     */
+    static gboolean check_shutdown_cb(gpointer user_data) {
+      if (auto *ctx = static_cast<loop_context_t *>(user_data); ctx->shutdown_event && ctx->shutdown_event->peek()) {
+        g_main_loop_quit(ctx->loop);
+        return G_SOURCE_REMOVE;
+      }
+      return G_SOURCE_CONTINUE;
+    }
+
+    /**
+     * @brief Check for DBus response with optional timeout guard.
+     *
+     * @param response DBus response.
+     * @param timeout_seconds Timeout in seconds before quitting loop.
+     * @return Variant containing the requested data.
+     */
+    static GVariant *dbus_response_wait(dbus_response_t *response, guint timeout_seconds = 0) {
+      GSource *timeout_source = nullptr;
+
+      if (timeout_seconds > 0) {
+        timeout_source = g_timeout_source_new(timeout_seconds * 1000);
+        g_source_set_callback(
+          timeout_source,
+          [](gpointer user_data) {
+            g_main_loop_quit(static_cast<GMainLoop *>(user_data));
+            return G_SOURCE_REMOVE;
+          },
+          response->loop,
+          nullptr
+        );
+        g_source_attach(timeout_source, g_main_loop_get_context(response->loop));
+      }
+
+      constexpr guint shutdown_poll_interval_ms = 1000;
+      auto shutdown_event = mail::man ? mail::man->event<bool>(mail::shutdown) : nullptr;
+      loop_context_t ctx {response->loop, shutdown_event};
+
+      GSource *shutdown_source = g_timeout_source_new(shutdown_poll_interval_ms);
+      g_source_set_callback(shutdown_source, check_shutdown_cb, &ctx, nullptr);
+      g_source_attach(shutdown_source, g_main_loop_get_context(response->loop));
+
       g_main_loop_run(response->loop);
-      return response->response;
+
+      if (response->subscription_id != 0) {
+        g_dbus_connection_signal_unsubscribe(
+          response->conn,
+          response->subscription_id
+        );
+      }
+      response->subscription_id = 0;
+
+      g_source_destroy(shutdown_source);
+      g_source_unref(shutdown_source);
+
+      if (timeout_source) {
+        g_source_destroy(timeout_source);
+        g_source_unref(timeout_source);
+      }
+
+      if (response->response) {
+        return response->response;
+      }
+
+      BOOST_LOG(info) << "[portalgrab] Portal request cancelled, timed out, or shutdown requested"sv;
+      close_request_async(response->conn, response->request_path);
+      return nullptr;
     }
   };
 
@@ -821,7 +1102,7 @@ namespace portal {
         BOOST_LOG(error) << "[portalgrab] Failed to connect to dbus. portal_t setup failed.";
         return -1;
       }
-      if (dbus.connect_to_portal() < 0) {
+      if (dbus.connect_to_portal(false) < 0) {
         BOOST_LOG(error) << "[portalgrab] Failed to connect to portal. portal_t setup failed.";
         return -1;
       }
@@ -851,7 +1132,7 @@ namespace portal {
       pipewire.set_negotiate_maxframerate(negotiate_maxframerate.load());
 
       // Return values for pipewire init
-      out_pipewire_fd = dbus.pipewire_fd;
+      out_pipewire_fd = std::exchange(dbus.pipewire_fd, -1);
       out_pipewire_node = stream.pipewire_node;
       out_pipewire_object_serial = stream.pipewire_object_serial;
       // Set/update basic stream parameters on display_t
@@ -876,7 +1157,7 @@ namespace portal {
       if (dbus.is_session_closed()) {
         BOOST_LOG(warning) << "[portalgrab] PipeWire stream stopped by closed portal session."sv;
         pipewire.frame_cv().notify_all();
-        out_status = platf::capture_e::error;
+        out_status = platf::capture_e::capture_error;
         return true;  // Stop capture with error (due to out_status)
       }
       // Disable maxframerate negotiation if the stream died without having ever started (e.g. GNOME mutter does not support it)
@@ -894,7 +1175,7 @@ namespace portal {
     dbus_t dbus;  ///< DBus connection used for portal screencast requests.
 
     // Class variable to store runtime state of maxFramerate negotiation
-    static inline std::atomic<bool> negotiate_maxframerate {true};  ///< Whether portal negotiation should request the maximum frame rate.
+    static inline std::atomic negotiate_maxframerate {true};  ///< Whether portal negotiation should request the maximum frame rate.
   };
 }  // namespace portal
 
@@ -914,11 +1195,6 @@ namespace platf {
       return nullptr;
     }
 
-    // Drop CAP_SYS_ADMIN, CAP_SYS_NICE and set DUMPABLE flag to allow XDG /root access
-    if (has_elevated_privileges(true)) {
-      drop_elevated_privileges(true);
-    }
-
     auto portal = std::make_shared<portal::portal_t>();
     if (portal->init(hwdevice_type, display_name, config)) {
       return nullptr;
@@ -930,9 +1206,10 @@ namespace platf {
   /**
    * @brief Enumerate capture targets available through xdg-desktop-portal.
    *
+   * @param allow_start_timeout True if "Start" DBus call is allowed to time out.
    * @return Portal display names, or an empty list when portal discovery fails.
    */
-  std::vector<std::string> portal_display_names() {
+  std::vector<std::string> portal_display_names(bool allow_start_timeout) {
     std::vector<std::string> display_names;
     auto dbus = std::make_shared<portal::dbus_t>();
 
@@ -941,14 +1218,7 @@ namespace platf {
       return {};
     }
 
-    if (has_elevated_privileges(true)) {
-      // We're still in the probing phase of Sunshine startup. Dropping portal security early will break KMS.
-      // Just return a dummy screen for now. Display re-enumeration after encoder probing will yield full result.
-      display_names.emplace_back("init");
-      return display_names;
-    }
-
-    if (dbus->connect_to_portal() < 0) {
+    if (dbus->connect_to_portal(allow_start_timeout) < 0) {
       BOOST_LOG(warning) << "[portalgrab] Failed to connect to portal. Cannot enumerate displays, returning empty list.";
       return {};
     }

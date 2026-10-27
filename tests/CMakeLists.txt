@@ -93,6 +93,9 @@ set(TEST_DEFINITIONS)  # list will be appended as needed
 list(APPEND TEST_DEFINITIONS SUNSHINE_TESTS)
 list(APPEND TEST_DEFINITIONS SUNSHINE_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 list(APPEND TEST_DEFINITIONS SUNSHINE_TEST_BIN_DIR="${CMAKE_CURRENT_BINARY_DIR}")
+if(SUNSHINE_ENABLE_TRAY)
+    list(APPEND TEST_DEFINITIONS TRAY_ENABLE_TEST_HOOKS)
+endif()
 
 # Override SUNSHINE_ASSETS_DIR to use a writable temp directory for tests
 # Remove the existing definition from SUNSHINE_DEFINITIONS to avoid redefinition error
@@ -122,7 +125,7 @@ if(SUNSHINE_ENABLE_TRAY AND (WIN32 OR APPLE OR CMAKE_SYSTEM_NAME STREQUAL "Linux
             "${SUNSHINE_TRAY_TEST_ICON_DESTINATION_DIR}/logo-sunshine.svg"
             COPYONLY)
 
-    if(WIN32)
+    if(WIN32 OR APPLE)
         configure_file(
                 "${CMAKE_SOURCE_DIR}/third-party/libvirtualhid/libvirtualhid.svg"
                 "${SUNSHINE_TRAY_TEST_ICON_DESTINATION_DIR}/logo-libvirtualhid.svg"
@@ -190,13 +193,40 @@ add_executable(${PROJECT_NAME}
 # This ensures both CLI and CLion can access the same files relative to the test executable
 # Using configure_file ensures files are copied when they change between builds
 set(INTEGRATION_TEST_FILES
+    "cmake/compile_definitions/macos.cmake"
+    "cmake/dependencies/Boost_Sunshine.cmake"
+    "cmake/macros/common.cmake"
+    "cmake/prep/options.cmake"
+    "package-lock.cmake"
+    "packaging/linux/Arch/PKGBUILD"
+    "packaging/linux/flatpak/modules/boost.json"
+    "scripts/linux_build.sh"
     "src/config.cpp"
-    "src_assets/common/assets/web/config.html"
+    "src_assets/common/assets/web/Config.vue"
+    "docs/building.md"
     "docs/configuration.md"
+    "docs/getting_started.md"
+    "docs/troubleshooting.md"
     "src_assets/common/assets/web/public/assets/locale/en.json"
+    "src_assets/common/assets/web/configs/config_tabs.json"
+    "src_assets/common/assets/web/configs/VirtualKeyCodeSelect.vue"
+    "src_assets/common/assets/web/configs/virtual_key_codes.js"
     "src_assets/common/assets/web/configs/tabs/General.vue"
+    "src_assets/common/assets/web/configs/tabs/Inputs.vue"
     "src_assets/linux/misc/60-sunshine.rules"
 )
+
+if(EXISTS "${CMAKE_SOURCE_DIR}/packaging/linux/copr/Sunshine.spec")
+    list(APPEND INTEGRATION_TEST_FILES "packaging/linux/copr/Sunshine.spec")
+    list(APPEND TEST_DEFINITIONS SUNSHINE_COPR_SPEC_FIXTURE_AVAILABLE)
+endif()
+
+if(APPLE)
+    list(APPEND INTEGRATION_TEST_FILES
+        ".github/workflows/ci-macos.yml"
+        "scripts/macos_build.sh"
+    )
+endif()
 
 foreach(file ${INTEGRATION_TEST_FILES})
     configure_file(
@@ -252,6 +282,11 @@ target_compile_options(${PROJECT_NAME} PRIVATE $<$<COMPILE_LANGUAGE:CXX>:${SUNSH
 target_link_options(${PROJECT_NAME} PRIVATE ${SUNSHINE_LINK_OPTIONS})
 
 if (WIN32)
+    # Compile the utility test with the SDK 13.1 implementation namespace and headers.
+    set_source_files_properties(unit/test_nvenc_utils.cpp PROPERTIES
+            COMPILE_DEFINITIONS "NVENC_NAMESPACE=nvenc_1301;NVENC_SDK_VERSION=1301"
+            INCLUDE_DIRECTORIES "${NV_CODEC_HEADERS_13_1_INCLUDE_DIR}")
+
     # prefer static libraries since we're linking statically
     # this fixes libcurl linking errors when using non MSYS2 version of CMake
     set_target_properties(${PROJECT_NAME} PROPERTIES LINK_SEARCH_START_STATIC 1)

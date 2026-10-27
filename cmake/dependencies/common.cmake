@@ -56,6 +56,10 @@ if(SUNSHINE_ENABLE_TRAY)
 
     add_subdirectory("${CMAKE_SOURCE_DIR}/third-party/tray")
 
+    if(BUILD_TESTS)
+        target_compile_definitions(tray PRIVATE TRAY_ENABLE_TEST_HOOKS)
+    endif()
+
     if(SUNSHINE_USE_STATIC_QT)
         set(CMAKE_FIND_LIBRARY_SUFFIXES "${_sunshine_find_library_suffixes}")
         set(CMAKE_IMPORT_LIBRARY_SUFFIX "${_sunshine_import_library_suffix}")
@@ -84,13 +88,19 @@ include("${CMAKE_MODULE_PATH}/dependencies/miniupnpc.cmake")
 include("${CMAKE_MODULE_PATH}/dependencies/ffmpeg.cmake")
 
 # Opus
-# Homebrew provides opus as a dynamic library only, so disable static linking for Homebrew builds
-if(SUNSHINE_BUILD_HOMEBREW)
-    set(OPUS_USE_STATIC OFF CACHE BOOL "Static linking for libopus")
+if(TARGET PkgConfig::SUNSHINE_BUNDLED_OPUS)
+    # Match the Opus version linked by the shared FFmpeg package.
+    set(Opus_LIBRARY PkgConfig::SUNSHINE_BUNDLED_OPUS)  # cmake-lint: disable=C0103
+    set(Opus_INCLUDE_DIR "${FFMPEG_INCLUDE_DIRS}")  # cmake-lint: disable=C0103
 else()
-    set(OPUS_USE_STATIC ON CACHE BOOL "Static linking for libopus")
+    # Homebrew provides opus as a dynamic library only, so disable static linking for Homebrew builds
+    if(SUNSHINE_BUILD_HOMEBREW)
+        set(OPUS_USE_STATIC OFF CACHE BOOL "Static linking for libopus")
+    else()
+        set(OPUS_USE_STATIC ON CACHE BOOL "Static linking for libopus")
+    endif()
+    include("${CMAKE_MODULE_PATH}/dependencies/FindOpus.cmake")
 endif()
-include("${CMAKE_MODULE_PATH}/dependencies/FindOpus.cmake")
 
 # platform specific dependencies
 if(WIN32)
