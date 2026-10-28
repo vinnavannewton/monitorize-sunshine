@@ -51,6 +51,20 @@ function componentStyle(markup, selector) {
 }
 
 /**
+ * @brief Both local host instances share Monitorize's standard blue navigation.
+ */
+describe.each(['light', 'dark'])('%s Monitorize navigation accent', theme => {
+  it('uses the Monitorize blue header with readable text and unchanged warning colors', () => {
+    document.documentElement.dataset.theme = theme
+    const style = getComputedStyle(document.documentElement)
+    expect(style.getPropertyValue('--navbar-bg').trim()).toBe('#1676d2')
+    expect(style.getPropertyValue('--navbar-text').trim()).toBe('#ffffff')
+    expect(style.getPropertyValue('--navbar-text-muted').replace(/\s/g, '')).toBe('rgba(255,255,255,0.85)')
+    expect(style.getPropertyValue('--color-warning').trim()).toBe('#ffc107')
+  })
+})
+
+/**
  * @brief Mount the featured page with a deterministic app directory.
  *
  * @param {object} directory App and category data returned by the directory service.

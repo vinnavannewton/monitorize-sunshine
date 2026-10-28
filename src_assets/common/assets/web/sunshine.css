@@ -56,6 +56,10 @@
    Dark Themes
    ========================================================================== */
 
+/**
+ * @brief Match Monitorize blue navigation in the standard dark/light themes.
+ * Warning colors and alternate user-selected palettes retain their semantics.
+ */
 /* Dark Theme - Simple clean dark design */
 [data-theme="dark"] {
     --color-primary: #0d6efd;
@@ -92,9 +96,9 @@
     --color-text-muted: #adb5bd;
     --color-text-subtle: #6c757d;
 
-    --navbar-bg: linear-gradient(135deg, #ffc400 0%, #ff9d00 100%);
-    --navbar-text: #594400;
-    --navbar-text-muted: #7f6100;
+    --navbar-bg: #1676d2;
+    --navbar-text: #ffffff;
+    --navbar-text-muted: rgba(255, 255, 255, 0.85);
 
     --shadow-sm: 0 1px 2px 0 rgba(0, 0, 0, 0.3);
     --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.4), 0 2px 4px -1px rgba(0, 0, 0, 0.3);
@@ -522,9 +526,9 @@
     --color-text-muted: #6c757d;
     --color-text-subtle: #adb5bd;
 
-    --navbar-bg: linear-gradient(135deg, #ffc400 0%, #ff9d00 100%);
-    --navbar-text: #594400;
-    --navbar-text-muted: #7f6100;
+    --navbar-bg: #1676d2;
+    --navbar-text: #ffffff;
+    --navbar-text-muted: rgba(255, 255, 255, 0.85);
 }
 
 /* Forest Theme - Green nature tones */
