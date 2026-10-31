@@ -2320,14 +2320,25 @@ namespace platf {
   }  // namespace kms
 
   /**
-   * @brief Create a KMS display capture backend.
-   *
-   * @param hwdevice_type Hardware device type requested for capture or encode.
-   * @param display_name Display name.
-   * @param config Configuration values to apply.
-   * @return KMS display backend, or nullptr when initialization fails.
+   * @brief Refresh DRM displays and their correlated Wayland input geometry.
+   * @param hwdevice_type Encoder memory type used to filter DRM cards.
+   * @return Names of the currently available KMS displays.
+   */
+  std::vector<std::string> kms_display_names(mem_type_e hwdevice_type);
+
+  /**
+   * @brief Create capture for the requested KMS display using current geometry.
+   * @details Monitorize can disable physical outputs after the first frame. Its
+   *          pinned-output refresh skips display enumeration, so refresh the KMS
+   *          cache here before resolving the connector and input viewport.
+   * @param hwdevice_type Encoder memory type used for capture.
+   * @param display_name Requested connector name or legacy monitor index.
+   * @param config Stream video configuration.
+   * @return Capture display, or null when the requested display cannot be opened.
    */
   std::shared_ptr<display_t> kms_display(mem_type_e hwdevice_type, const std::string &display_name, const ::video::config_t &config) {
+    kms_display_names(hwdevice_type);
+
     if (hwdevice_type == mem_type_e::vaapi || hwdevice_type == mem_type_e::cuda || hwdevice_type == mem_type_e::vulkan) {
       auto disp = std::make_shared<kms::display_vram_t>(hwdevice_type);
 
