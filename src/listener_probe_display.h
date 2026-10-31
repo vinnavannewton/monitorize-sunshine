@@ -27,12 +27,23 @@ namespace video {
     }
     std::shared_ptr<platf::img_t> alloc_img() override { return std::make_shared<image>(width,height); }
     int dummy_img(platf::img_t *) override { return 0; }
-    std::unique_ptr<platf::avcodec_encode_device_t> make_avcodec_encode_device(platf::pix_fmt_e) override {
+    /**
+     * @brief Create a probe device using the same RAM fallback as real capture.
+     * @param pix_fmt Requested encoder pixel format (conversion is configured later).
+     * @return Encoding device, or null when the requested backend is unavailable.
+     */
+    std::unique_ptr<platf::avcodec_encode_device_t> make_avcodec_encode_device([[maybe_unused]] platf::pix_fmt_e pix_fmt) override {
 #ifdef SUNSHINE_BUILD_VAAPI
       if (type==platf::mem_type_e::vaapi) return va::make_avcodec_encode_device(width,height,false);
 #endif
 #ifdef SUNSHINE_BUILD_CUDA
       if (type==platf::mem_type_e::cuda) return cuda::make_avcodec_encode_device(width,height,false);
+#else
+      // NVENC can consume frames converted in RAM without Sunshine's CUDA kernels.
+      // FFmpeg still initializes and validates the NVIDIA encoder during probing.
+      if (type == platf::mem_type_e::cuda) {
+        return std::make_unique<platf::avcodec_encode_device_t>();
+      }
 #endif
       if (type==platf::mem_type_e::system) return std::make_unique<platf::avcodec_encode_device_t>();
       return nullptr;
